@@ -3094,6 +3094,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Messages that arrive while the bot is processing (between trigger
         # and response) are not captured — this is an accepted simplification
         # to keep the partition rule clean.
+        _channel_context = None
         _is_dm = isinstance(message.channel, discord.DMChannel)
         if not _is_dm:
             _is_shared = (
@@ -3111,11 +3112,13 @@ class DiscordAdapter(BasePlatformAdapter):
                     message.channel, before=message,
                 )
                 if _backfill_text:
-                    event_text = f"{_backfill_text}\n\n[New message]\n{event_text}"
+                    _channel_context = _backfill_text
 
         # Defense-in-depth: prevent empty user messages from entering session
-        # (can happen when user sends @mention-only with no other text)
-        if not event_text or not event_text.strip():
+        # (can happen when user sends @mention-only with no other text).
+        # When channel_context is present, a bare mention means "catch me up"
+        # — the context IS the message, so skip the placeholder.
+        if (not event_text or not event_text.strip()) and not _channel_context:
             event_text = "(The user sent a message with no text content)"
 
         _chan = message.channel
@@ -3144,6 +3147,7 @@ class DiscordAdapter(BasePlatformAdapter):
             timestamp=message.created_at,
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
+            channel_context=_channel_context,
         )
 
         # Track thread participation so the bot won't require @mention for

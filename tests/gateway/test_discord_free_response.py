@@ -579,7 +579,8 @@ async def test_discord_shared_channel_backfill_prepends_context(adapter, monkeyp
 
     adapter._fetch_channel_context.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
-    assert event.text == "[Recent channel messages]\n[Alice] context\n\n[New message]\nhello with mention"
+    assert event.text == "hello with mention"
+    assert event.channel_context == "[Recent channel messages]\n[Alice] context"
 
 
 @pytest.mark.asyncio
@@ -603,3 +604,4 @@ async def test_discord_per_user_channel_does_not_backfill(adapter, monkeypatch):
     adapter._fetch_channel_context.assert_not_awaited()
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "hello with mention"
+    assert event.channel_context is None
