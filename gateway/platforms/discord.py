@@ -2305,6 +2305,105 @@ class DiscordAdapter(BasePlatformAdapter):
             return {part.strip() for part in raw.split(",") if part.strip()}
         return set()
 
+    def _discord_history_backfill(self) -> bool:
+        """Return whether history backfill is enabled for shared sessions."""
+        configured = self.config.extra.get("history_backfill")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in ("false", "0", "no", "off")
+            return bool(configured)
+        return os.getenv("DISCORD_HISTORY_BACKFILL", "false").lower() in ("true", "1", "yes")
+
+    def _discord_history_backfill_limit(self) -> int:
+        """Return the max number of messages to scan backwards for context.
+
+        In practice the scan usually stops much earlier — at the bot's own
+        last message in the channel (the natural partition point).  This
+        limit is a safety cap for cold starts and long gaps where no prior
+        bot message exists in recent history.
+        """
+        configured = self.config.extra.get("history_backfill_limit")
+        if configured is not None:
+            try:
+                return int(configured)
+            except (ValueError, TypeError):
+                pass
+        raw = os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT", "50")
+        try:
+            return int(raw)
+        except (ValueError, TypeError):
+            return 50
+
+    async def _fetch_channel_context(
+        self,
+        channel: Any,
+        before: "DiscordMessage",
+    ) -> str:
+        """Fetch recent channel messages for conversational context.
+
+        Scans backwards from *before* and collects messages until it hits
+        a message sent by this bot (the natural partition point between
+        bot turns) or reaches ``history_backfill_limit``.
+
+        Returns a formatted block like::
+
+            [Recent channel messages]
+            [Alice] some message
+            [Bob [bot]] another message
+
+        Returns an empty string if no context is available.
+        """
+        limit = self._discord_history_backfill_limit()
+        if limit <= 0:
+            return ""
+
+        # Determine which bot messages to include in context
+        allow_bots_raw = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
+        include_other_bots = allow_bots_raw != "none"
+
+        try:
+            collected = []
+            async for msg in channel.history(limit=limit, before=before):
+                # Stop at our own message — this is the partition point.
+                # Everything before this is already in the session transcript.
+                if msg.author == self._client.user:
+                    break
+
+                # Skip system messages (pins, joins, thread renames, etc.)
+                if msg.type not in (discord.MessageType.default, discord.MessageType.reply):
+                    continue
+
+                # Respect DISCORD_ALLOW_BOTS for other bots.
+                # For history context, "mentions" is treated as "all" — we are
+                # deciding what context to show, not whether to respond.
+                if getattr(msg.author, "bot", False) and not include_other_bots:
+                    continue
+
+                content = msg.content or ""
+                if not content and msg.attachments:
+                    content = "(attachment)"
+                if not content:
+                    continue
+
+                name = msg.author.display_name
+                if getattr(msg.author, "bot", False):
+                    name = f"{name} [bot]"
+                collected.append(f"[{name}] {content}")
+
+            if not collected:
+                return ""
+
+            # channel.history returns newest-first; reverse for chronological order
+            collected.reverse()
+            return "[Recent channel messages]\n" + "\n".join(collected)
+
+        except discord.Forbidden:
+            logger.debug("[%s] Missing permissions to fetch channel history", self.name)
+            return ""
+        except Exception as e:
+            logger.warning("[%s] Failed to fetch channel history: %s", self.name, e)
+            return ""
+
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
         return getattr(channel, "parent", None) or channel
@@ -2976,6 +3075,43 @@ class DiscordAdapter(BasePlatformAdapter):
         event_text = message.content
         if pending_text_injection:
             event_text = f"{pending_text_injection}\n\n{event_text}" if event_text else pending_text_injection
+
+        # ── History backfill ─────────────────────────────────────────
+        # When require_mention is active, the bot only processes messages
+        # that @mention it.  This means channel messages between bot turns
+        # are invisible to the session transcript.  To recover that context,
+        # fetch recent channel history and prepend it to the user message.
+        #
+        # The fetch window is: everything after the bot's last message in
+        # the channel up to (but not including) the current trigger.  On
+        # cold start (no prior bot message found), fetch the last N messages
+        # and stop at the first self-message encountered.
+        #
+        # This only runs for shared sessions (group_sessions_per_user=False
+        # or shared threads) where multiple users contribute context the bot
+        # would otherwise miss.
+        #
+        # Messages that arrive while the bot is processing (between trigger
+        # and response) are not captured — this is an accepted simplification
+        # to keep the partition rule clean.
+        _is_dm = isinstance(message.channel, discord.DMChannel)
+        if not _is_dm:
+            _is_shared = (
+                (is_thread and not self.config.extra.get("thread_sessions_per_user", False))
+                or (not is_thread and not self.config.extra.get("group_sessions_per_user", True))
+            )
+            _needed_mention = (
+                require_mention
+                and not is_free_channel
+                and not in_bot_thread
+            )
+            _backfill_enabled = self._discord_history_backfill()
+            if _is_shared and _needed_mention and _backfill_enabled:
+                _backfill_text = await self._fetch_channel_context(
+                    message.channel, before=message,
+                )
+                if _backfill_text:
+                    event_text = f"{_backfill_text}\n\n[New message]\n{event_text}"
 
         # Defense-in-depth: prevent empty user messages from entering session
         # (can happen when user sends @mention-only with no other text)

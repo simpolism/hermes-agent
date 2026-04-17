@@ -62,6 +62,12 @@ class FakeTextChannel:
         self.guild = SimpleNamespace(name=guild_name)
         self.topic = None
 
+    def history(self, *, limit, before):
+        async def _iter():
+            if False:
+                yield None
+        return _iter()
+
 
 class FakeForumChannel:
     def __init__(self, channel_id: int = 1, name: str = "support-forum", guild_name: str = "Hermes Server"):
@@ -109,6 +115,40 @@ def make_message(*, channel, content: str, mentions=None, msg_type=None):
         author=author,
         type=msg_type if msg_type is not None else discord_platform.discord.MessageType.default,
     )
+
+
+def make_history_message(
+    *,
+    author,
+    content: str,
+    msg_id: int,
+    msg_type=None,
+    attachments=None,
+):
+    return SimpleNamespace(
+        id=msg_id,
+        author=author,
+        content=content,
+        attachments=list(attachments or []),
+        type=msg_type if msg_type is not None else discord_platform.discord.MessageType.default,
+    )
+
+
+class FakeHistoryChannel(FakeTextChannel):
+    def __init__(self, history_messages, **kwargs):
+        super().__init__(**kwargs)
+        self._history_messages = list(history_messages)
+
+    def history(self, *, limit, before):
+        async def _iter():
+            count = 0
+            for message in self._history_messages:
+                if count >= limit:
+                    break
+                count += 1
+                yield message
+
+        return _iter()
 
 
 @pytest.mark.asyncio
@@ -468,3 +508,98 @@ async def test_discord_voice_linked_parent_thread_still_requires_mention(adapter
     await adapter._handle_message(message)
 
     adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_context_stops_at_self_message_and_reverses_to_chronological_order(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    adapter.config.extra["history_backfill_limit"] = 10
+
+    other_bot = SimpleNamespace(id=55, display_name="Gemini", name="Gemini", bot=True)
+    human = SimpleNamespace(id=56, display_name="Alice", name="Alice", bot=False)
+    old_human = SimpleNamespace(id=57, display_name="Bob", name="Bob", bot=False)
+
+    channel = FakeHistoryChannel(
+        [
+            make_history_message(author=human, content="latest human note", msg_id=4),
+            make_history_message(author=other_bot, content="latest bot note", msg_id=3),
+            make_history_message(author=adapter._client.user, content="our prior response", msg_id=2),
+            make_history_message(author=old_human, content="older than boundary", msg_id=1),
+        ],
+        channel_id=123,
+    )
+
+    result = await adapter._fetch_channel_context(channel, before=make_message(channel=channel, content="trigger"))
+
+    assert result == (
+        "[Recent channel messages]\n"
+        "[Gemini [bot]] latest bot note\n"
+        "[Alice] latest human note"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_context_skips_other_bots_when_allow_bots_none(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "none")
+    adapter.config.extra["history_backfill_limit"] = 10
+
+    other_bot = SimpleNamespace(id=55, display_name="Gemini", name="Gemini", bot=True)
+    human = SimpleNamespace(id=56, display_name="Alice", name="Alice", bot=False)
+
+    channel = FakeHistoryChannel(
+        [
+            make_history_message(author=human, content="human note", msg_id=3),
+            make_history_message(author=other_bot, content="bot note", msg_id=2),
+        ],
+        channel_id=123,
+    )
+
+    result = await adapter._fetch_channel_context(channel, before=make_message(channel=channel, content="trigger"))
+
+    assert result == "[Recent channel messages]\n[Alice] human note"
+
+
+@pytest.mark.asyncio
+async def test_discord_shared_channel_backfill_prepends_context(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["group_sessions_per_user"] = False
+    adapter.config.extra["history_backfill"] = True
+    adapter._fetch_channel_context = AsyncMock(return_value="[Recent channel messages]\n[Alice] context")
+
+    bot_user = adapter._client.user
+    message = make_message(
+        channel=FakeTextChannel(channel_id=321),
+        content=f"<@{bot_user.id}> hello with mention",
+        mentions=[bot_user],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._fetch_channel_context.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "[Recent channel messages]\n[Alice] context\n\n[New message]\nhello with mention"
+
+
+@pytest.mark.asyncio
+async def test_discord_per_user_channel_does_not_backfill(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["group_sessions_per_user"] = True
+    adapter.config.extra["history_backfill"] = True
+    adapter._fetch_channel_context = AsyncMock(return_value="[Recent channel messages]\n[Alice] context")
+
+    bot_user = adapter._client.user
+    message = make_message(
+        channel=FakeTextChannel(channel_id=321),
+        content=f"<@{bot_user.id}> hello with mention",
+        mentions=[bot_user],
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._fetch_channel_context.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hello with mention"
