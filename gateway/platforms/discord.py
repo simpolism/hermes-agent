@@ -2571,7 +2571,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if getattr(msg.author, "bot", False) and not include_other_bots:
                     continue
 
-                content = msg.content or ""
+                content = getattr(msg, "clean_content", msg.content) or ""
                 if not content and msg.attachments:
                     content = "(attachment)"
                 if not content:
