@@ -3373,12 +3373,17 @@ class GatewayRunner:
         history = history or []
         message_text = event.text or ""
 
-        _is_shared_thread = (
+        # Prefix sender name when multiple users share a session.  This
+        # covers both shared threads (thread_sessions_per_user=False, the
+        # default) and shared channels (group_sessions_per_user=False).
+        _is_shared_session = (
             source.chat_type != "dm"
-            and source.thread_id
-            and not getattr(self.config, "thread_sessions_per_user", False)
+            and (
+                (source.thread_id and not getattr(self.config, "thread_sessions_per_user", False))
+                or (not source.thread_id and not getattr(self.config, "group_sessions_per_user", True))
+            )
         )
-        if _is_shared_thread and source.user_name:
+        if _is_shared_session and source.user_name:
             message_text = f"[{source.user_name}] {message_text}"
 
         if event.media_urls:

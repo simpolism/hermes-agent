@@ -158,6 +158,12 @@ class SessionContext:
     session_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+    # True when multiple users share this session (shared thread or shared
+    # channel with group_sessions_per_user=False).  Used to decide whether
+    # to prefix messages with [sender name] and note multi-user context in
+    # the system prompt.
+    is_shared_session: bool = False
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -240,18 +246,15 @@ def build_session_context_prompt(
         lines.append(f"**Channel Topic:** {context.source.chat_topic}")
 
     # User identity.
-    # In shared thread sessions (non-DM with thread_id), multiple users
-    # contribute to the same conversation.  Don't pin a single user name
-    # in the system prompt — it changes per-turn and would bust the prompt
-    # cache.  Instead, note that this is a multi-user thread; individual
-    # sender names are prefixed on each user message by the gateway.
-    _is_shared_thread = (
-        context.source.chat_type != "dm"
-        and context.source.thread_id
-    )
-    if _is_shared_thread:
+    # In shared sessions (threads or channels with group_sessions_per_user
+    # disabled), multiple users contribute to the same conversation.  Don't
+    # pin a single user name in the system prompt — it changes per-turn and
+    # would bust the prompt cache.  Instead, note that this is a multi-user
+    # session; individual sender names are prefixed on each user message by
+    # the gateway.
+    if context.is_shared_session:
         lines.append(
-            "**Session type:** Multi-user thread — messages are prefixed "
+            "**Session type:** Multi-user session — messages are prefixed "
             "with [sender name]. Multiple users may participate."
         )
     elif context.source.user_name:
@@ -1076,10 +1079,22 @@ def build_session_context(
         if home:
             home_channels[platform] = home
     
+    # Determine if this is a shared session where multiple users can
+    # contribute.  This mirrors the isolation logic in build_session_key():
+    # threads are shared by default (thread_sessions_per_user=False), and
+    # channels/groups are shared when group_sessions_per_user=False.
+    _is_shared = False
+    if source.chat_type != "dm":
+        if source.thread_id and not config.thread_sessions_per_user:
+            _is_shared = True
+        elif not source.thread_id and not config.group_sessions_per_user:
+            _is_shared = True
+
     context = SessionContext(
         source=source,
         connected_platforms=connected,
         home_channels=home_channels,
+        is_shared_session=_is_shared,
     )
     
     if session_entry:

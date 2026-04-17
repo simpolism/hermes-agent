@@ -331,13 +331,35 @@ class TestBuildSessionContextPrompt:
         ctx = build_session_context(source, config)
         prompt = build_session_context_prompt(ctx)
 
-        assert "Multi-user thread" in prompt
+        assert "Multi-user session" in prompt
         assert "[sender name]" in prompt
         # Should NOT show a specific **User:** line (would bust cache)
         assert "**User:** Alice" not in prompt
 
+    def test_shared_channel_no_thread_shows_multi_user(self):
+        """Shared channel sessions (group_sessions_per_user=False) show multi-user note."""
+        config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake"),
+            },
+            group_sessions_per_user=False,
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1002285219667",
+            chat_name="Test Group",
+            chat_type="group",
+            user_name="Alice",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "Multi-user session" in prompt
+        assert "[sender name]" in prompt
+        assert "**User:** Alice" not in prompt
+
     def test_non_thread_group_shows_user(self):
-        """Regular group messages (no thread) still show the user name."""
+        """Regular group messages (no thread, per-user sessions) still show the user name."""
         config = GatewayConfig(
             platforms={
                 Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake"),
@@ -354,7 +376,7 @@ class TestBuildSessionContextPrompt:
         prompt = build_session_context_prompt(ctx)
 
         assert "**User:** Alice" in prompt
-        assert "Multi-user thread" not in prompt
+        assert "Multi-user session" not in prompt
 
     def test_dm_thread_shows_user_not_multi(self):
         """DM threads are single-user and should show User, not multi-user note."""
@@ -374,7 +396,7 @@ class TestBuildSessionContextPrompt:
         prompt = build_session_context_prompt(ctx)
 
         assert "**User:** Alice" in prompt
-        assert "Multi-user thread" not in prompt
+        assert "Multi-user session" not in prompt
 
 
 class TestSessionStoreRewriteTranscript:
