@@ -527,6 +527,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+        # In-memory cache of the bot's last message ID per channel, used by
+        # history backfill to skip the full scan on hot paths.  Falls back to
+        # scanning channel.history() on cache miss (cold start / restart).
+        self._last_self_message_id: Dict[str, str] = {}
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -950,6 +954,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     else:
                         raise
                 message_ids.append(str(msg.id))
+
+            # Track the last message we sent in this channel for history
+            # backfill — avoids a full channel.history() scan on hot paths.
+            if message_ids:
+                _target_id = thread_id or chat_id
+                self._last_self_message_id[_target_id] = message_ids[-1]
 
             return SendResult(
                 success=True,
@@ -2553,11 +2563,28 @@ class DiscordAdapter(BasePlatformAdapter):
         allow_bots_raw = os.getenv("DISCORD_ALLOW_BOTS", "none").lower().strip()
         include_other_bots = allow_bots_raw != "none"
 
+        # Use the in-memory cache to narrow the fetch window on hot paths.
+        # If we know our last message ID in this channel, pass it as `after`
+        # to avoid scanning the full limit.  Falls back to scanning on cache
+        # miss (cold start / restart).
+        # Guard: only use the cache when it's chronologically before the
+        # trigger — Discord snowflake IDs are monotonically increasing, so
+        # a simple int comparison suffices.
+        channel_id = str(getattr(channel, "id", ""))
+        _cached_id = self._last_self_message_id.get(channel_id)
+        _after_obj = None
+        try:
+            if _cached_id and int(_cached_id) < int(before.id):
+                _after_obj = discord.Object(id=int(_cached_id))
+        except (ValueError, TypeError):
+            pass  # Malformed cache entry — fall back to cold-start scan
+
         try:
             collected = []
-            async for msg in channel.history(limit=limit, before=before):
+            async for msg in channel.history(limit=limit, before=before, after=_after_obj):
                 # Stop at our own message — this is the partition point.
                 # Everything before this is already in the session transcript.
+                # (Redundant when _after_obj is set, but needed for cold start.)
                 if msg.author == self._client.user:
                     break
 

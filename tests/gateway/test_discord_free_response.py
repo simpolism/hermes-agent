@@ -64,8 +64,8 @@ class FakeTextChannel:
 
     def history(self, *, limit, before):
         async def _iter():
-            if False:
-                yield None
+            return
+            yield
         return _iter()
 
 
@@ -139,7 +139,7 @@ class FakeHistoryChannel(FakeTextChannel):
         super().__init__(**kwargs)
         self._history_messages = list(history_messages)
 
-    def history(self, *, limit, before):
+    def history(self, *, limit, before, after=None):
         async def _iter():
             count = 0
             for message in self._history_messages:
@@ -557,6 +557,73 @@ async def test_fetch_channel_context_skips_other_bots_when_allow_bots_none(adapt
     result = await adapter._fetch_channel_context(channel, before=make_message(channel=channel, content="trigger"))
 
     assert result == "[Recent channel messages]\n[Alice] human note"
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_context_uses_cache_to_narrow_window(adapter, monkeypatch):
+    """When _last_self_message_id is cached, the fetch passes after= to skip old messages."""
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    adapter.config.extra["history_backfill_limit"] = 50
+
+    human = SimpleNamespace(id=56, display_name="Alice", name="Alice", bot=False)
+
+    # Record the after= arg passed to history()
+    recorded_after = {}
+
+    class CacheTrackingChannel(FakeHistoryChannel):
+        def history(self, *, limit, before, after=None):
+            recorded_after["value"] = after
+            return super().history(limit=limit, before=before, after=after)
+
+    channel = CacheTrackingChannel(
+        [make_history_message(author=human, content="hello", msg_id=200)],
+        channel_id=777,
+    )
+
+    # Seed the cache — bot's last message in this channel was ID 100
+    adapter._last_self_message_id["777"] = "100"
+
+    trigger = make_message(channel=channel, content="trigger")
+    trigger.id = 300  # trigger is newer than cache
+
+    result = await adapter._fetch_channel_context(channel, before=trigger)
+
+    assert result == "[Recent channel messages]\n[Alice] hello"
+    # Verify cache was used: after= should be set (not None)
+    assert recorded_after["value"] is not None
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_context_ignores_stale_cache(adapter, monkeypatch):
+    """If cached ID is >= trigger ID (stale/future), fall back to cold-start scan."""
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    adapter.config.extra["history_backfill_limit"] = 50
+
+    human = SimpleNamespace(id=56, display_name="Alice", name="Alice", bot=False)
+
+    recorded_after = {}
+
+    class CacheTrackingChannel(FakeHistoryChannel):
+        def history(self, *, limit, before, after=None):
+            recorded_after["value"] = after
+            return super().history(limit=limit, before=before, after=after)
+
+    channel = CacheTrackingChannel(
+        [make_history_message(author=human, content="hello", msg_id=50)],
+        channel_id=777,
+    )
+
+    # Cache has a NEWER ID than the trigger — stale/invalid
+    adapter._last_self_message_id["777"] = "500"
+
+    trigger = make_message(channel=channel, content="trigger")
+    trigger.id = 300
+
+    result = await adapter._fetch_channel_context(channel, before=trigger)
+
+    assert result == "[Recent channel messages]\n[Alice] hello"
+    # Cache should have been ignored — after= should be None
+    assert recorded_after["value"] is None
 
 
 @pytest.mark.asyncio
