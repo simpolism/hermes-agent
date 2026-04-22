@@ -627,6 +627,49 @@ class TestSummaryTargetRatio:
             c = ContextCompressor(model="test", quiet_mode=True)
         assert c.protect_last_n == 20
 
+    def test_default_protect_first_n_is_3(self):
+        """Default protect_first_n should be 3 (system prompt + first exchange)."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+        assert c.protect_first_n == 3
+
+    def test_protect_first_n_override(self):
+        """protect_first_n=1 should be honoured — for users who rely on rolling
+        compaction and don't want the opening user/assistant turn pinned as head
+        indefinitely.  Only the system prompt survives head-protection."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1)
+        assert c.protect_first_n == 1
+
+    def test_protect_first_n_1_preserves_only_system_prompt(self):
+        """End-to-end: when protect_first_n=1, compression should treat only
+        the first message (system prompt) as head.  Messages 1..n-protect_last-1
+        become summarization candidates, unlike the default where messages 0-2
+        would all be pinned as head."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=2,
+            )
+        msgs = (
+            [{"role": "system", "content": "System prompt"}]
+            + [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
+               for i in range(8)]
+        )
+        result = c.compress(msgs)
+        # System prompt (msg[0]) survives as head
+        assert result[0]["role"] == "system"
+        assert result[0]["content"].startswith("System prompt")
+        # The first user/assistant exchange (msg 0, msg 1) should NOT be pinned
+        # as head verbatim — those would have been summarized or absorbed.
+        # Under default protect_first_n=3, result[1] and result[2] would be
+        # the literal "msg 0" / "msg 1"; with protect_first_n=1 they aren't.
+        assert result[1].get("content") != "msg 0"
+        # Last 2 messages are tail-protected under protect_last_n=2
+        assert result[-1]["content"] == msgs[-1]["content"]
+
 
 class TestTokenBudgetTailProtection:
     """Tests for token-budget-based tail protection (PR #6240).

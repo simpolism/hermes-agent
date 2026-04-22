@@ -1538,6 +1538,12 @@ class AIAgent:
         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in ("true", "1", "yes")
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
+        # Floor protect_first_n at 1 — the system prompt must always be
+        # preserved as head, otherwise compression would strip it on the
+        # first compaction pass and the model would lose its identity.
+        compression_protect_first = max(
+            1, int(_compression_cfg.get("protect_first_n", 3))
+        )
 
         # Read optional explicit context_length override for the auxiliary
         # compression model. Custom endpoints often cannot report this via
@@ -1684,7 +1690,7 @@ class AIAgent:
             self.context_compressor = ContextCompressor(
                 model=self.model,
                 threshold_percent=compression_threshold,
-                protect_first_n=3,
+                protect_first_n=compression_protect_first,
                 protect_last_n=compression_protect_last,
                 summary_target_ratio=compression_target_ratio,
                 summary_model_override=None,

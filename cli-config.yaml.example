@@ -323,6 +323,16 @@ compression:
   # compression of older turns.
   protect_last_n: 20
 
+  # Number of earliest messages to always preserve verbatim as head (default: 3 =
+  # system prompt + first user/assistant exchange). Head messages are NEVER
+  # summarized — they survive every compression indefinitely. This gives stable
+  # early context for short/medium sessions, but in long-running sessions that
+  # rely on rolling compaction the opening user turn gets pinned forever, which
+  # may not match how you want the session framed. Lower to 1 to preserve only
+  # the system prompt and let the first exchange age out naturally through the
+  # summary. Minimum: 1 (system prompt must survive).
+  protect_first_n: 3
+
   # To pin a specific model/provider for compression summaries, use the
   # auxiliary section below (auxiliary.compression.provider / model).
 
