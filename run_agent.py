@@ -3981,7 +3981,9 @@ class AIAgent:
         "2. Has the user expressed expectations about how you should behave, their work "
         "style, or ways they want you to operate?\n\n"
         "If something stands out, save it using the memory tool. "
-        "If nothing is worth saving, just say 'Nothing to save.' and stop."
+        "If nothing is worth saving, just say 'Nothing to save.' and stop.\n\n"
+        "Scope: this is a background review. Only use memory/skill tools; "
+        "do not invoke any other tool."
     )
 
     _SKILL_REVIEW_PROMPT = (
@@ -4077,7 +4079,9 @@ class AIAgent:
         "'Nothing to save.' is a real option but should NOT be the "
         "default. If the session ran smoothly with no corrections and "
         "produced no new technique, just say 'Nothing to save.' and stop. "
-        "Otherwise, act."
+        "Otherwise, act.\n\n"
+        "Scope: this is a background review. Only use memory/skill tools; "
+        "do not invoke any other tool."
     )
 
     _COMBINED_REVIEW_PROMPT = (
@@ -4153,7 +4157,9 @@ class AIAgent:
         "standalone constraint.\n\n"
         "Act on whichever of the two dimensions has real signal. If "
         "genuinely nothing stands out on either, say 'Nothing to save.' "
-        "and stop — but don't reach for that conclusion as a default."
+        "and stop — but don't reach for that conclusion as a default.\n\n"
+        "Scope: this is a background review. Only use memory/skill tools; "
+        "do not invoke any other tool."
     )
 
     @staticmethod
@@ -4284,7 +4290,14 @@ class AIAgent:
                         api_key=_parent_runtime.get("api_key") or None,
                         credential_pool=getattr(self, "_credential_pool", None),
                         parent_session_id=self.session_id,
-                        enabled_toolsets=["memory", "skills"],
+                        # Inherit parent's full toolset rather than narrowing to
+                        # ["memory", "skills"]: the review prompt is tool-scoped
+                        # by instruction, and matching the parent's tool surface
+                        # keeps the review's system prompt bit-identical to the
+                        # parent's, preserving Anthropic prompt-cache hits AND
+                        # letting preprocessing tree-dedup collapse the review
+                        # into the same conversation leaf as the main session.
+                        enabled_toolsets=self.enabled_toolsets,
                     )
                     review_agent._memory_write_origin = "background_review"
                     review_agent._memory_write_context = "background_review"
@@ -4301,6 +4314,19 @@ class AIAgent:
                     # _vprint and leak past the stdout redirect (they go via
                     # _print_fn/status_callback, which bypass sys.stdout).
                     review_agent.suppress_status_output = True
+                    # Pin the review's session metadata to the parent's so the
+                    # system prompt rebuilds (if any) produce identical output.
+                    # session_start drives the "Conversation started:" line;
+                    # session_id can appear in the prompt for pass_session_id
+                    # setups.
+                    review_agent.session_start = self.session_start
+                    review_agent.session_id = self.session_id
+                    # And inherit the parent's already-assembled system prompt
+                    # so the review skips _build_system_prompt entirely — this
+                    # is what actually makes the first HTTP request's prefix
+                    # match the parent's.
+                    if self._cached_system_prompt is not None:
+                        review_agent._cached_system_prompt = self._cached_system_prompt
 
                     review_agent.run_conversation(
                         user_message=prompt,

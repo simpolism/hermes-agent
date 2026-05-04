@@ -7,6 +7,7 @@ from run_agent import AIAgent
 
 
 def _bare_agent() -> AIAgent:
+    import datetime as _dt
     agent = object.__new__(AIAgent)
     agent.model = "fake-model"
     agent.platform = "telegram"
@@ -15,11 +16,14 @@ def _bare_agent() -> AIAgent:
     agent.api_key = ""
     agent.api_mode = ""
     agent.session_id = "test-session"
+    agent.session_start = _dt.datetime(2026, 1, 1, 12, 0, 0)
     agent._parent_session_id = ""
     agent._credential_pool = None
     agent._memory_store = object()
     agent._memory_enabled = True
     agent._user_profile_enabled = False
+    agent._cached_system_prompt = None
+    agent.enabled_toolsets = None
     agent._MEMORY_REVIEW_PROMPT = "review memory"
     agent._SKILL_REVIEW_PROMPT = "review skills"
     agent._COMBINED_REVIEW_PROMPT = "review both"
@@ -190,3 +194,75 @@ def test_background_review_summary_is_attributed_to_self_improvement_loop(monkey
     assert captured_bg_callback[0].startswith("💾 Self-improvement review:"), (
         captured_bg_callback[0]
     )
+
+
+def test_background_review_inherits_parent_system_prompt_and_toolsets(monkeypatch):
+    """Regression guard: the background review must be bit-identical to the
+    parent's system-prompt prefix so Anthropic prompt cache hits survive AND
+    preprocessing tree-dedup can collapse the review into the same
+    conversation leaf as the main session.
+
+    Two things must hold:
+      1. ``enabled_toolsets`` is inherited from the parent (not narrowed to
+         ["memory", "skills"], which would produce a different skills-block
+         in the system prompt).
+      2. The parent's already-assembled ``_cached_system_prompt`` is copied
+         onto the review agent so _build_system_prompt is skipped entirely.
+      3. The parent's ``session_start`` and ``session_id`` are also mirrored
+         onto the review agent in case any rebuild path runs.
+    """
+    captured_init: dict = {}
+    captured_attrs: dict = {}
+
+    parent_toolsets = ["terminal", "web", "memory", "skills"]
+    parent_cached_prompt = "PARENT_CACHED_SYSTEM_PROMPT"
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            captured_init.update(kwargs)
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            # Snapshot the review agent's attrs at run time so we can
+            # assert the parent's values were installed BEFORE dispatch.
+            captured_attrs["_cached_system_prompt"] = self._cached_system_prompt
+            captured_attrs["session_start"] = self.session_start
+            captured_attrs["session_id"] = self.session_id
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    agent.enabled_toolsets = parent_toolsets
+    agent._cached_system_prompt = parent_cached_prompt
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    # (1) Full toolset inheritance — NOT hard-coded to a narrow subset.
+    assert captured_init["enabled_toolsets"] == parent_toolsets, (
+        f"Background review must inherit the parent's full toolset to keep "
+        f"its system prompt bit-identical to the parent's; got "
+        f"{captured_init['enabled_toolsets']!r} instead of {parent_toolsets!r}."
+    )
+
+    # (2) Parent's cached system prompt installed before run_conversation.
+    assert captured_attrs["_cached_system_prompt"] == parent_cached_prompt, (
+        "Background review must inherit the parent's _cached_system_prompt "
+        "so _build_system_prompt is skipped and the first HTTP request's "
+        "prefix matches the parent's verbatim (Anthropic prompt-cache hit, "
+        "preprocessing tree-dedup)."
+    )
+
+    # (3) session_start + session_id mirrored for any rebuild paths.
+    assert captured_attrs["session_start"] == agent.session_start
+    assert captured_attrs["session_id"] == agent.session_id
