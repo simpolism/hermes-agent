@@ -667,11 +667,12 @@ DEFAULT_CONFIG = {
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "hygiene_hard_message_limit": 400,  # gateway session-hygiene force-compress threshold by message count
-        "protect_first_n": 3,         # head messages always preserved verbatim
-                                      # (system prompt + first exchange). Lower this
-                                      # to 1 if you rely on rolling compaction for
-                                      # long-running sessions and don't want the
-                                      # opening user/assistant turn pinned forever.
+        "protect_first_n": 3,         # non-system head messages always preserved
+                                      # verbatim, in ADDITION to the system prompt
+                                      # (which is always implicitly protected). Set to
+                                      # 0 for long-running rolling-compaction sessions
+                                      # where you want nothing pinned except the
+                                      # system prompt + rolling summary + recent tail.
     },
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
     # cache_ttl must be "5m" or "1h" (Anthropic-supported tiers); other values are ignored.
