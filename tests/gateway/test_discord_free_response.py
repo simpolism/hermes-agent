@@ -62,7 +62,7 @@ class FakeTextChannel:
         self.guild = SimpleNamespace(name=guild_name)
         self.topic = None
 
-    def history(self, *, limit, before):
+    def history(self, *, limit, before, after=None, oldest_first=None):
         async def _iter():
             return
             yield
@@ -153,13 +153,21 @@ class FakeHistoryChannel(FakeTextChannel):
         super().__init__(**kwargs)
         self._history_messages = list(history_messages)
 
-    def history(self, *, limit, before, after=None):
+    def history(self, *, limit, before, after=None, oldest_first=None):
+        before_id = int(getattr(before, "id", before))
+        after_id = int(getattr(after, "id", after)) if after is not None else None
+        if oldest_first is None:
+            oldest_first = after is not None
+
+        messages = [
+            message for message in self._history_messages
+            if int(message.id) < before_id
+            and (after_id is None or int(message.id) > after_id)
+        ]
+        messages.sort(key=lambda message: int(message.id), reverse=not oldest_first)
+
         async def _iter():
-            count = 0
-            for message in self._history_messages:
-                if count >= limit:
-                    break
-                count += 1
+            for message in messages[:limit]:
                 yield message
 
         return _iter()
@@ -580,9 +588,14 @@ async def test_fetch_channel_context_uses_cache_to_narrow_window(adapter, monkey
     recorded_after = {}
 
     class CacheTrackingChannel(FakeHistoryChannel):
-        def history(self, *, limit, before, after=None):
+        def history(self, *, limit, before, after=None, oldest_first=None):
             recorded_after["value"] = after
-            return super().history(limit=limit, before=before, after=after)
+            return super().history(
+                limit=limit,
+                before=before,
+                after=after,
+                oldest_first=oldest_first,
+            )
 
     channel = CacheTrackingChannel(
         [make_history_message(author=human, content="hello", msg_id=200)],
@@ -603,6 +616,43 @@ async def test_fetch_channel_context_uses_cache_to_narrow_window(adapter, monkey
 
 
 @pytest.mark.asyncio
+async def test_fetch_channel_context_cache_uses_latest_window_when_after_set(adapter, monkeypatch):
+    """Regression: discord.py defaults oldest_first=True when after= is provided.
+
+    The hot cache path passes both after= and before=. We still want the latest
+    messages before the trigger, not the earliest messages after our prior
+    response, otherwise tool traces can crowd out the final answer.
+    """
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    adapter.config.extra["history_backfill_limit"] = 3
+
+    codex = SimpleNamespace(id=56, display_name="Codex", name="Codex", bot=True)
+    human = SimpleNamespace(id=57, display_name="Alice", name="Alice", bot=False)
+
+    channel = FakeHistoryChannel(
+        [
+            make_history_message(author=codex, content="old tool trace 1", msg_id=101),
+            make_history_message(author=codex, content="old tool trace 2", msg_id=102),
+            make_history_message(author=codex, content="old tool trace 3", msg_id=103),
+            make_history_message(author=codex, content="final analysis", msg_id=104),
+            make_history_message(author=human, content="latest follow-up", msg_id=105),
+        ],
+        channel_id=777,
+    )
+    adapter._last_self_message_id["777"] = "100"
+
+    trigger = make_message(channel=channel, content="trigger")
+    trigger.id = 200
+
+    result = await adapter._fetch_channel_context(channel, before=trigger)
+
+    assert "[Codex [bot]] final analysis" in result
+    assert "[Alice] latest follow-up" in result
+    assert "old tool trace 1" not in result
+    assert "old tool trace 2" not in result
+
+
+@pytest.mark.asyncio
 async def test_fetch_channel_context_ignores_stale_cache(adapter, monkeypatch):
     """If cached ID is >= trigger ID (stale/future), fall back to cold-start scan."""
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
@@ -613,9 +663,14 @@ async def test_fetch_channel_context_ignores_stale_cache(adapter, monkeypatch):
     recorded_after = {}
 
     class CacheTrackingChannel(FakeHistoryChannel):
-        def history(self, *, limit, before, after=None):
+        def history(self, *, limit, before, after=None, oldest_first=None):
             recorded_after["value"] = after
-            return super().history(limit=limit, before=before, after=after)
+            return super().history(
+                limit=limit,
+                before=before,
+                after=after,
+                oldest_first=oldest_first,
+            )
 
     channel = CacheTrackingChannel(
         [make_history_message(author=human, content="hello", msg_id=50)],

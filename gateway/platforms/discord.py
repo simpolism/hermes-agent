@@ -3680,7 +3680,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
         try:
             collected = []
-            async for msg in channel.history(limit=limit, before=before, after=_after_obj):
+            async for msg in channel.history(
+                limit=limit,
+                before=before,
+                after=_after_obj,
+                oldest_first=False,
+            ):
                 # Stop at our own message — this is the partition point.
                 # Everything before this is already in the session transcript.
                 # (Redundant when _after_obj is set, but needed for cold start.)
