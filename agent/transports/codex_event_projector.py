@@ -72,8 +72,9 @@ class CodexEventProjector:
     Owns the in-progress reasoning content (codex emits reasoning as separate
     items but Hermes stashes it on the next assistant message)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, project_user_messages: bool = True) -> None:
         self._pending_reasoning: list[str] = []
+        self._project_user_messages = project_user_messages
 
     def project(self, notification: dict) -> ProjectionResult:
         """Project a single notification. Idempotent for non-completion events;
@@ -107,6 +108,8 @@ class CodexEventProjector:
         if item_type == "dynamicToolCall":
             return self._project_dynamic_tool_call(item, item_id)
         if item_type == "userMessage":
+            if not self._project_user_messages:
+                return ProjectionResult()
             return self._project_user_message(item)
 
         # Unknown / rare items (plan, hookPrompt, collabAgentToolCall, etc.)

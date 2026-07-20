@@ -72,6 +72,27 @@ class TestProjectionInvariants:
         r = p.project({"method": "totally/unknown", "params": {}})
         assert r.messages == []
 
+    def test_user_echo_can_be_suppressed_by_transport(self) -> None:
+        notification = {
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "userMessage",
+                    "id": "user-1",
+                    "content": [{"type": "text", "text": "hello"}],
+                }
+            },
+        }
+        assert CodexEventProjector().project(notification).messages == [
+            {"role": "user", "content": "hello"}
+        ]
+        assert (
+            CodexEventProjector(project_user_messages=False)
+            .project(notification)
+            .messages
+            == []
+        )
+
 
 class TestCommandExecutionProjection:
     """Real captured notification → assistant tool_call + tool result."""

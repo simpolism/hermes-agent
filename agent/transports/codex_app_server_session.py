@@ -213,6 +213,7 @@ class CodexAppServerSession:
         self,
         *,
         cwd: Optional[str] = None,
+        model: Optional[str] = None,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
@@ -220,10 +221,12 @@ class CodexAppServerSession:
         on_event: Optional[Callable[[dict], None]] = None,
         resume_thread_id: Optional[str] = None,
         on_thread_ready: Optional[Callable[[str], None]] = None,
+        on_resume_fallback: Optional[Callable[[str], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
+        self._model = (model or "").strip() or None
         self._codex_bin = codex_bin
         self._codex_home = codex_home
         self._permission_profile = (
@@ -236,6 +239,7 @@ class CodexAppServerSession:
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._resume_thread_id = (resume_thread_id or "").strip() or None
         self._on_thread_ready = on_thread_ready
+        self._on_resume_fallback = on_resume_fallback
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
 
@@ -286,9 +290,15 @@ class CodexAppServerSession:
         resumed = False
         if self._resume_thread_id:
             try:
+                resume_params: dict[str, Any] = {
+                    "threadId": self._resume_thread_id,
+                    "cwd": self._cwd,
+                }
+                if self._model:
+                    resume_params["model"] = self._model
                 result = self._client.request(
                     "thread/resume",
-                    {"threadId": self._resume_thread_id, "cwd": self._cwd},
+                    resume_params,
                     timeout=15,
                 )
                 resumed = True
@@ -298,10 +308,13 @@ class CodexAppServerSession:
                     self._resume_thread_id[:8],
                     exc,
                 )
+                self._notify_resume_fallback(self._resume_thread_id)
                 self._resume_thread_id = None
 
         if result is None:
             params: dict[str, Any] = {"cwd": self._cwd}
+            if self._model:
+                params["model"] = self._model
             result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
@@ -320,11 +333,13 @@ class CodexAppServerSession:
                 "starting fresh",
                 (self._resume_thread_id or "")[:8],
             )
+            self._notify_resume_fallback(self._resume_thread_id)
             resumed = False
             self._resume_thread_id = None
-            result = self._client.request(
-                "thread/start", {"cwd": self._cwd}, timeout=15
-            )
+            start_params: dict[str, Any] = {"cwd": self._cwd}
+            if self._model:
+                start_params["model"] = self._model
+            result = self._client.request("thread/start", start_params, timeout=15)
             thread_obj = result.get("thread") or {}
             thread_id = (
                 thread_obj.get("id")
@@ -355,6 +370,15 @@ class CodexAppServerSession:
             self._cwd,
         )
         return self._thread_id
+
+    def _notify_resume_fallback(self, thread_id: Optional[str]) -> None:
+        if self._on_resume_fallback is None:
+            return
+        short_id = (thread_id or "unknown")[:8]
+        try:
+            self._on_resume_fallback(short_id)
+        except Exception:
+            logger.debug("Could not report codex resume fallback", exc_info=True)
 
     def close(self) -> None:
         if self._closed:
@@ -460,7 +484,11 @@ class CodexAppServerSession:
         result.thread_id = self._thread_id
 
         self._interrupt_event.clear()
-        projector = CodexEventProjector()
+        # AIAgent has already appended the canonical user message before it
+        # invokes this transport.  Codex echoes the same input as a
+        # ``userMessage`` item; projecting that echo would persist every
+        # gateway user turn twice.
+        projector = CodexEventProjector(project_user_messages=False)
 
         # Send turn/start with native typed input. Hermes gateway turns may
         # already carry Codex ``localImage`` items; API callers commonly use

@@ -21,6 +21,7 @@ from agent.model_metadata import estimate_messages_tokens_rough
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource
+from gateway.run import _gateway_hygiene_enabled
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +193,13 @@ class TestSessionHygieneThresholds:
         # Even with enormous content, < 4 messages should be skipped
         # (the gateway code checks `len(history) >= 4` before evaluating)
         assert len(history) < 4
+
+    def test_native_codex_runtime_owns_its_compaction(self):
+        assert not _gateway_hygiene_enabled(True, "codex_app_server")
+
+    def test_standard_runtime_keeps_gateway_hygiene(self):
+        assert _gateway_hygiene_enabled(True, "responses")
+        assert not _gateway_hygiene_enabled(False, "responses")
 
 
 class TestSessionHygieneWarnThreshold:

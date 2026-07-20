@@ -63,6 +63,80 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_MEDIA_TAG_RE = re.compile(r"MEDIA:(\S+)")
+
+
+def _collect_current_turn_media_tags(
+    messages: list[dict], history_len: int
+) -> tuple[list[str], bool]:
+    """Collect safe, tool-produced media from only the current turn.
+
+    Tool output is untrusted text: source listings, documentation, or a
+    remote MCP server can all contain a syntactically valid ``MEDIA:`` token.
+    Only honor tags correlated to a known media-producing tool, require the
+    target to be an existing regular file, and constrain MCP-produced images
+    to Hermes' own image cache.  Explicit tags in the assistant's final reply
+    continue to be handled by the platform adapter.
+    """
+    current = messages[history_len:] if len(messages) > history_len else []
+    producers: dict[str, str] = {}
+    for message in current:
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            call_id = call.get("id")
+            function = call.get("function") or {}
+            if call_id and function.get("name"):
+                producers[str(call_id)] = str(function["name"])
+
+    try:
+        from gateway.platforms.base import IMAGE_CACHE_DIR
+
+        image_cache = IMAGE_CACHE_DIR.resolve()
+    except Exception:
+        image_cache = None
+
+    tags: list[str] = []
+    seen: set[str] = set()
+    has_voice_directive = False
+    for message in current:
+        if message.get("role") not in {"tool", "function"}:
+            continue
+        producer = producers.get(str(message.get("tool_call_id") or ""), "")
+        producer_leaf = producer.rsplit(".", 1)[-1]
+        if producer_leaf != "text_to_speech" and not producer.startswith("mcp."):
+            continue
+        content = message.get("content") or ""
+        for match in _MEDIA_TAG_RE.finditer(str(content)):
+            raw_path = match.group(1).strip().rstrip('",}')
+            candidate = Path(raw_path).expanduser()
+            try:
+                resolved = candidate.resolve(strict=True)
+            except (OSError, RuntimeError):
+                continue
+            if not resolved.is_file():
+                continue
+            if producer.startswith("mcp.") and producer_leaf != "text_to_speech":
+                if image_cache is None or not resolved.is_relative_to(image_cache):
+                    continue
+            tag = f"MEDIA:{resolved}"
+            if tag not in seen:
+                seen.add(tag)
+                tags.append(tag)
+        if producer_leaf == "text_to_speech" and "[[audio_as_voice]]" in str(content):
+            has_voice_directive = True
+
+    return tags, has_voice_directive
+
+
+def _gateway_hygiene_enabled(compression_enabled: bool, api_mode: Optional[str]) -> bool:
+    """Whether the gateway should pre-compress a rehydrated transcript.
+
+    Native Codex threads own their context and compaction lifecycle. Running
+    Hermes compression first both discards transcript rows and can create a
+    second compression boundary immediately before ``thread/resume``.
+    """
+    return compression_enabled and api_mode != "codex_app_server"
 
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
@@ -7246,6 +7320,7 @@ class GatewayRunner:
             _hyg_provider = None
             _hyg_base_url = None
             _hyg_api_key = None
+            _hyg_api_mode = None
             _hyg_data = {}
             try:
                 _hyg_data = _load_gateway_config()
@@ -7294,6 +7369,7 @@ class GatewayRunner:
                     _hyg_provider = _hyg_runtime.get("provider") or _hyg_provider
                     _hyg_base_url = _hyg_runtime.get("base_url") or _hyg_base_url
                     _hyg_api_key = _hyg_runtime.get("api_key") or _hyg_api_key
+                    _hyg_api_mode = _hyg_runtime.get("api_mode") or _hyg_api_mode
                 except Exception:
                     pass
 
@@ -7327,7 +7403,7 @@ class GatewayRunner:
             except Exception:
                 pass
 
-            if _hyg_compression_enabled:
+            if _gateway_hygiene_enabled(_hyg_compression_enabled, _hyg_api_mode):
                 _hyg_context_length = get_model_context_length(
                     _hyg_model,
                     base_url=_hyg_base_url or "",
@@ -15294,19 +15370,6 @@ class GatewayRunner:
                         entry = _build_replay_entry(role, content, msg)
                         agent_history.append(entry)
             
-            # Collect MEDIA paths already in history so we can exclude them
-            # from the current turn's extraction. This is compression-safe:
-            # even if the message list shrinks, we know which paths are old.
-            _history_media_paths: set = set()
-            for _hm in agent_history:
-                if _hm.get("role") in {"tool", "function"}:
-                    _hc = _hm.get("content", "")
-                    if "MEDIA:" in _hc:
-                        for _match in re.finditer(r'MEDIA:(\S+)', _hc):
-                            _p = _match.group(1).strip().rstrip('",}')
-                            if _p:
-                                _history_media_paths.add(_p)
-            
             # Register per-session gateway approval callback so dangerous
             # command approval blocks the agent thread (mirrors CLI input()).
             # The callback bridges sync→async to send the approval request
@@ -15585,33 +15648,14 @@ class GatewayRunner:
             # append any that aren't already present in the final response, so the
             # adapter's extract_media() can find and deliver the files exactly once.
             #
-            # Uses path-based deduplication against _history_media_paths (collected
-            # before run_conversation) instead of index slicing. This is safe even
-            # when context compression shrinks the message list. (Fixes #160)
             if "MEDIA:" not in final_response:
-                media_tags = []
-                has_voice_directive = False
-                for msg in result.get("messages", []):
-                    if msg.get("role") in {"tool", "function"}:
-                        content = msg.get("content", "")
-                        if "MEDIA:" in content:
-                            for match in re.finditer(r'MEDIA:(\S+)', content):
-                                path = match.group(1).strip().rstrip('",}')
-                                if path and path not in _history_media_paths:
-                                    media_tags.append(f"MEDIA:{path}")
-                            if "[[audio_as_voice]]" in content:
-                                has_voice_directive = True
-                
+                media_tags, has_voice_directive = _collect_current_turn_media_tags(
+                    result.get("messages", []), len(agent_history)
+                )
                 if media_tags:
-                    seen = set()
-                    unique_tags = []
-                    for tag in media_tags:
-                        if tag not in seen:
-                            seen.add(tag)
-                            unique_tags.append(tag)
                     if has_voice_directive:
-                        unique_tags.insert(0, "[[audio_as_voice]]")
-                    final_response = final_response + "\n" + "\n".join(unique_tags)
+                        media_tags.insert(0, "[[audio_as_voice]]")
+                    final_response = final_response + "\n" + "\n".join(media_tags)
             
             # Sync session_id: the agent may have created a new session during
             # mid-run context compression (_compress_context splits sessions).

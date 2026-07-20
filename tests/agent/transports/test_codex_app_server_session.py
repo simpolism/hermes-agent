@@ -151,6 +151,27 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_model_override_is_applied_to_start_and_resume(self):
+        start_client = FakeClient()
+        make_session(start_client, model="gpt-test").ensure_started()
+        assert ("thread/start", {"cwd": "/tmp", "model": "gpt-test"}) in start_client.requests
+
+        resume_client = FakeClient()
+        resume_client._request_handler = lambda method, params: (
+            {"thread": {"id": params["threadId"]}}
+            if method == "thread/resume"
+            else {}
+        )
+        make_session(
+            resume_client,
+            model="gpt-test",
+            resume_thread_id="thread-existing",
+        ).ensure_started()
+        assert (
+            "thread/resume",
+            {"threadId": "thread-existing", "cwd": "/tmp", "model": "gpt-test"},
+        ) in resume_client.requests
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)
@@ -184,6 +205,7 @@ class TestLifecycle:
 
         client = FakeClient()
         ready = []
+        fallbacks = []
 
         def handler(method, params):
             if method == "thread/resume":
@@ -197,15 +219,18 @@ class TestLifecycle:
             client,
             resume_thread_id="thread-stale",
             on_thread_ready=ready.append,
+            on_resume_fallback=fallbacks.append,
         )
         assert s.ensure_started() == "thread-replacement"
         assert [method for method, _ in client.requests] == [
             "thread/resume", "thread/start"
         ]
         assert ready == ["thread-replacement"]
+        assert fallbacks == ["thread-s"]
 
     def test_malformed_resume_response_falls_back_to_start(self):
         client = FakeClient()
+        fallbacks = []
 
         def handler(method, params):
             if method == "thread/resume":
@@ -215,13 +240,47 @@ class TestLifecycle:
             return {}
 
         client._request_handler = handler
-        s = make_session(client, resume_thread_id="thread-malformed")
+        s = make_session(
+            client,
+            resume_thread_id="thread-malformed",
+            on_resume_fallback=fallbacks.append,
+        )
         assert s.ensure_started() == "thread-fresh"
+        assert fallbacks == ["thread-m"]
 
 
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_codex_user_echo_is_not_projected_twice(self):
+        client = FakeClient()
+        client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "userMessage",
+                "id": "u1",
+                "content": [{"type": "text", "text": "hello"}],
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m1", "text": "hi"},
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed"},
+        )
+
+        result = make_session(client).run_turn("hello", turn_timeout=1)
+
+        assert result.projected_messages == [{"role": "assistant", "content": "hi"}]
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})

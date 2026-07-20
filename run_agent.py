@@ -15834,10 +15834,16 @@ class AIAgent:
             )
             self._codex_session = CodexAppServerSession(
                 cwd=cwd,
+                model=self.model,
                 approval_callback=approval_callback,
                 on_event=on_event,
                 resume_thread_id=_load_persisted_thread_id(),
                 on_thread_ready=_persist_thread_id,
+                on_resume_fallback=lambda short_id: self._emit_warning(
+                    "⚠️ The saved Codex thread "
+                    f"{short_id} could not be resumed, so I started a fresh one. "
+                    "Earlier native reasoning and tool context may be unavailable."
+                ),
             )
 
         # NOTE: the user message is ALREADY appended to messages by the
