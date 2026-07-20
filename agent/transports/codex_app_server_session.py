@@ -140,6 +140,55 @@ def _classify_oauth_failure(*parts: str) -> Optional[str]:
     return None
 
 
+def _normalize_turn_input(user_input: Any) -> list[dict[str, Any]]:
+    """Translate Hermes/OpenAI rich content into Codex ``UserInput`` items."""
+    if isinstance(user_input, str):
+        return [{"type": "text", "text": user_input}]
+    if not isinstance(user_input, list):
+        raise TypeError("Codex app-server user input must be text or a content list")
+
+    normalized: list[dict[str, Any]] = []
+    for index, part in enumerate(user_input):
+        if not isinstance(part, dict):
+            raise TypeError(f"Codex app-server input item {index} must be an object")
+
+        part_type = part.get("type")
+        if part_type in {"text", "input_text"}:
+            normalized.append({"type": "text", "text": str(part.get("text", ""))})
+            continue
+        if part_type == "localImage":
+            path = part.get("path")
+            if not isinstance(path, str) or not path:
+                raise ValueError(f"Codex app-server localImage item {index} needs a path")
+            item = {"type": "localImage", "path": path}
+            if part.get("detail") is not None:
+                item["detail"] = part["detail"]
+            normalized.append(item)
+            continue
+        if part_type in {"image", "image_url", "input_image"}:
+            raw_url = part.get("url") if part_type == "image" else part.get("image_url")
+            if isinstance(raw_url, dict):
+                raw_url = raw_url.get("url")
+            if not isinstance(raw_url, str) or not raw_url:
+                raise ValueError(f"Codex app-server image item {index} needs a URL")
+            item = {"type": "image", "url": raw_url}
+            detail = part.get("detail")
+            if detail is None and isinstance(part.get("image_url"), dict):
+                detail = part["image_url"].get("detail")
+            if detail is not None:
+                item["detail"] = detail
+            normalized.append(item)
+            continue
+
+        raise ValueError(
+            f"Unsupported Codex app-server input item type at index {index}: {part_type!r}"
+        )
+
+    if not normalized:
+        normalized.append({"type": "text", "text": ""})
+    return normalized
+
+
 @dataclass
 class _ServerRequestRouting:
     """Default policies for codex-side approval requests when no interactive
@@ -169,6 +218,8 @@ class CodexAppServerSession:
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        resume_thread_id: Optional[str] = None,
+        on_thread_ready: Optional[Callable[[str], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
@@ -183,6 +234,8 @@ class CodexAppServerSession:
         )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        self._resume_thread_id = (resume_thread_id or "").strip() or None
+        self._on_thread_ready = on_thread_ready
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
 
@@ -229,8 +282,27 @@ class CodexAppServerSession:
         # codex CLI workflow and avoids fighting codex's own validation.
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
-        params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        result = None
+        resumed = False
+        if self._resume_thread_id:
+            try:
+                result = self._client.request(
+                    "thread/resume",
+                    {"threadId": self._resume_thread_id, "cwd": self._cwd},
+                    timeout=15,
+                )
+                resumed = True
+            except (CodexAppServerError, TimeoutError) as exc:
+                logger.warning(
+                    "codex app-server thread resume failed for %s; starting fresh: %s",
+                    self._resume_thread_id[:8],
+                    exc,
+                )
+                self._resume_thread_id = None
+
+        if result is None:
+            params: dict[str, Any] = {"cwd": self._cwd}
+            result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -242,6 +314,24 @@ class CodexAppServerSession:
             or result.get("sessionId")
             or result.get("threadId")
         )
+        if not thread_id and resumed:
+            logger.warning(
+                "codex app-server thread/resume returned no thread id for %s; "
+                "starting fresh",
+                (self._resume_thread_id or "")[:8],
+            )
+            resumed = False
+            self._resume_thread_id = None
+            result = self._client.request(
+                "thread/start", {"cwd": self._cwd}, timeout=15
+            )
+            thread_obj = result.get("thread") or {}
+            thread_id = (
+                thread_obj.get("id")
+                or thread_obj.get("sessionId")
+                or result.get("sessionId")
+                or result.get("threadId")
+            )
         if not thread_id:
             raise CodexAppServerError(
                 code=-32603,
@@ -251,8 +341,15 @@ class CodexAppServerSession:
                 ),
             )
         self._thread_id = thread_id
+        self._resume_thread_id = thread_id
+        if self._on_thread_ready is not None:
+            try:
+                self._on_thread_ready(thread_id)
+            except Exception:
+                logger.debug("Could not persist codex thread id", exc_info=True)
         logger.info(
-            "codex app-server thread started: id=%s profile=%s cwd=%s",
+            "codex app-server thread %s: id=%s profile=%s cwd=%s",
+            "resumed" if resumed else "started",
             self._thread_id[:8],
             self._permission_profile,
             self._cwd,
@@ -327,7 +424,7 @@ class CodexAppServerSession:
 
     def run_turn(
         self,
-        user_input: str,
+        user_input: Any,
         *,
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
@@ -365,17 +462,22 @@ class CodexAppServerSession:
         self._interrupt_event.clear()
         projector = CodexEventProjector()
 
-        # Send turn/start with the user input. Text-only for now (codex
-        # supports rich content but Hermes' text path is the common case).
+        # Send turn/start with native typed input. Hermes gateway turns may
+        # already carry Codex ``localImage`` items; API callers commonly use
+        # OpenAI-style ``image_url`` parts, which are normalized here.
         try:
+            turn_input = _normalize_turn_input(user_input)
             ts = self._client.request(
                 "turn/start",
                 {
                     "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input}],
+                    "input": turn_input,
                 },
                 timeout=10,
             )
+        except (TypeError, ValueError) as exc:
+            result.error = f"Invalid Codex app-server turn input: {exc}"
+            return result
         except CodexAppServerError as exc:
             # Classify auth/refresh failures so the user gets a clear
             # `codex login` pointer instead of a raw RPC error string.

@@ -2571,6 +2571,18 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+
+        # A native Codex thread belongs to exactly one Hermes session. Session
+        # switches (/new, /resume, /branch) reuse the AIAgent object in some
+        # frontends, so retire the old transport before the next turn loads the
+        # target session's persisted thread identity.
+        codex_session = getattr(self, "_codex_session", None)
+        if codex_session is not None:
+            try:
+                codex_session.close()
+            except Exception:
+                pass
+            self._codex_session = None
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
@@ -10475,11 +10487,22 @@ class AIAgent:
                 # Update session_log_file to point to the new session's JSON file
                 self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
                 self._session_db_created = False
+                continuation_model_config = dict(self._session_init_model_config or {})
+                old_model_config = self._session_db.get_session_model_config(
+                    old_session_id
+                )
+                codex_thread_id = old_model_config.get(
+                    "codex_app_server_thread_id"
+                )
+                if codex_thread_id:
+                    continuation_model_config["codex_app_server_thread_id"] = (
+                        codex_thread_id
+                    )
                 self._session_db.create_session(
                     session_id=self.session_id,
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
-                    model_config=self._session_init_model_config,
+                    model_config=continuation_model_config,
                     parent_session_id=old_session_id,
                 )
                 self._session_db_created = True
@@ -12105,6 +12128,13 @@ class AIAgent:
         # 4xx and abort the request entirely).
         if (
             self.compression_enabled
+            # codex app-server owns the conversation history and performs
+            # native compaction inside its persisted thread. Hermes still
+            # keeps a projected transcript for recall/audit, but compressing
+            # that projection cannot reduce the app-server request (which
+            # contains only the current turn) and can rotate the Hermes
+            # session away from its persisted Codex thread id during restart.
+            and self.api_mode != "codex_app_server"
             and len(messages) > self.context_compressor.protect_first_n
                                 + self.context_compressor.protect_last_n + 1
         ):
@@ -15735,7 +15765,7 @@ class AIAgent:
     def _run_codex_app_server_turn(
         self,
         *,
-        user_message: str,
+        user_message: Any,
         original_user_message: Any,
         messages: List[Dict[str, Any]],
         effective_task_id: str,
@@ -15750,6 +15780,26 @@ class AIAgent:
         """
         from agent.transports.codex_app_server_session import CodexAppServerSession
         from agent.transports.codex_event_display import make_progress_bridge
+
+        def _load_persisted_thread_id() -> Optional[str]:
+            if not self._session_db:
+                return None
+            try:
+                config = self._session_db.get_session_model_config(self.session_id)
+                value = config.get("codex_app_server_thread_id")
+                return str(value).strip() if value else None
+            except Exception:
+                logger.debug("Could not load persisted codex thread id", exc_info=True)
+                return None
+
+        def _persist_thread_id(thread_id: str) -> None:
+            if not self._session_db:
+                return
+            self._session_db.update_session_model_config_value(
+                self.session_id,
+                "codex_app_server_thread_id",
+                thread_id,
+            )
 
         # Lazy session: one CodexAppServerSession per AIAgent instance.
         # Spawned on first turn, reused across turns, closed at AIAgent
@@ -15778,12 +15828,16 @@ class AIAgent:
             # cached across turns. A captured callback would route turn
             # N+1's tool events into turn N's dead queue.
             on_event = make_progress_bridge(
-                lambda: self.tool_progress_callback
+                lambda: self.tool_progress_callback,
+                lambda: self.tool_start_callback,
+                lambda: self.tool_complete_callback,
             )
             self._codex_session = CodexAppServerSession(
                 cwd=cwd,
                 approval_callback=approval_callback,
                 on_event=on_event,
+                resume_thread_id=_load_persisted_thread_id(),
+                on_thread_ready=_persist_thread_id,
             )
 
         # NOTE: the user message is ALREADY appended to messages by the

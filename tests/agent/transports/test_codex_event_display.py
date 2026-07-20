@@ -187,6 +187,75 @@ class TestCommandExecution:
         assert event_type == "tool.completed"
         assert tool_name == "exec_command"
 
+    def test_identity_lifecycle_uses_codex_item_id_and_result(self) -> None:
+        progress = MagicMock()
+        start = MagicMock()
+        complete = MagicMock()
+        bridge = make_progress_bridge(
+            lambda: progress,
+            lambda: start,
+            lambda: complete,
+        )
+
+        bridge(COMMAND_EXEC_STARTED)
+        bridge(COMMAND_EXEC_COMPLETED)
+
+        item_id = "f8a75c66-a89e-4fd7-8bcf-2d58e664fa9e"
+        start.assert_called_once_with(
+            item_id,
+            "exec_command",
+            {"command": "/bin/bash -lc 'ls /tmp'", "cwd": "/tmp"},
+        )
+        complete.assert_called_once_with(
+            item_id,
+            "exec_command",
+            {"command": "/bin/bash -lc 'ls /tmp'", "cwd": "/tmp"},
+            "file1\nfile2",
+        )
+
+    def test_lifecycle_does_not_require_progress_callback(self) -> None:
+        start = MagicMock()
+        bridge = make_progress_bridge(
+            lambda: None,
+            lambda: start,
+            lambda: None,
+        )
+        bridge(COMMAND_EXEC_STARTED)
+        assert start.call_args.args[0] == "f8a75c66-a89e-4fd7-8bcf-2d58e664fa9e"
+
+    def test_progress_failure_does_not_suppress_lifecycle(self) -> None:
+        start = MagicMock()
+
+        def broken_progress(*args, **kwargs):
+            raise RuntimeError("display disconnected")
+
+        bridge = make_progress_bridge(
+            lambda: broken_progress,
+            lambda: start,
+            lambda: None,
+        )
+        bridge(COMMAND_EXEC_STARTED)
+        start.assert_called_once()
+
+    def test_completed_progress_preserves_duration_and_failure(self) -> None:
+        bridge, cb = _capture()
+        failed = {
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "commandExecution",
+                    "id": "failed-1",
+                    "command": "false",
+                    "cwd": "/tmp",
+                    "status": "failed",
+                    "durationMs": 1250,
+                    "exitCode": 1,
+                }
+            },
+        }
+        bridge(failed)
+        assert cb.call_args.kwargs == {"duration": 1.25, "is_error": True}
+
     def test_long_command_truncated_in_preview(self) -> None:
         bridge, cb = _capture()
         long_cmd = "echo " + ("x" * 500)

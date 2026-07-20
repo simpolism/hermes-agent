@@ -750,6 +750,44 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def get_session_model_config(self, session_id: str) -> Dict[str, Any]:
+        """Return the decoded model_config object for a session."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        if not row or not row["model_config"]:
+            return {}
+        try:
+            value = json.loads(row["model_config"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def update_session_model_config_value(
+        self, session_id: str, key: str, value: Any
+    ) -> bool:
+        """Atomically merge one value into a session's model_config JSON."""
+        def _do(conn):
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                config = json.loads(row["model_config"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                config = {}
+            if not isinstance(config, dict):
+                config = {}
+            config[key] = value
+            conn.execute(
+                "UPDATE sessions SET model_config = ? WHERE id = ?",
+                (json.dumps(config), session_id),
+            )
+            return True
+        return bool(self._execute_write(_do))
+
     def update_token_counts(
         self,
         session_id: str,
@@ -2963,4 +3001,3 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
-

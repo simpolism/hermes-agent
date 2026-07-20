@@ -295,7 +295,48 @@ def build_native_content_parts(
     return parts, skipped
 
 
+def build_codex_app_server_content_parts(
+    user_text: str,
+    image_paths: List[str],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Build native Codex app-server input items for a user turn.
+
+    Unlike :func:`build_native_content_parts`, this keeps readable local
+    attachments as ``localImage`` items instead of reading and base64-encoding
+    them.  Codex app-server accepts the local path directly, which avoids a
+    needless memory/JSON expansion and preserves the original image for its
+    native vision pipeline.
+    """
+    skipped: List[str] = []
+    attached_paths: List[str] = []
+
+    for raw_path in image_paths:
+        path = Path(raw_path)
+        if not path.exists() or not path.is_file():
+            skipped.append(str(raw_path))
+            continue
+        attached_paths.append(str(path))
+
+    text = (user_text or "").strip()
+    parts: List[Dict[str, Any]] = []
+    if attached_paths:
+        base_text = text or "What do you see in this image?"
+        path_hints = "\n".join(
+            f"[Image attached at: {path}]" for path in attached_paths
+        )
+        parts.append({"type": "text", "text": f"{base_text}\n\n{path_hints}"})
+        parts.extend(
+            {"type": "localImage", "path": path}
+            for path in attached_paths
+        )
+    elif text:
+        parts.append({"type": "text", "text": text})
+
+    return parts, skipped
+
+
 __all__ = [
     "decide_image_input_mode",
     "build_native_content_parts",
+    "build_codex_app_server_content_parts",
 ]

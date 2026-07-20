@@ -1,6 +1,6 @@
 """Tests for Discord free-response defaults and mention gating."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 import sys
@@ -147,12 +147,14 @@ def make_history_message(
     msg_id: int,
     msg_type=None,
     attachments=None,
+    created_at=None,
 ):
     return SimpleNamespace(
         id=msg_id,
         author=author,
         content=content,
         attachments=list(attachments or []),
+        created_at=created_at,
         type=msg_type if msg_type is not None else discord_platform.discord.MessageType.default,
     )
 
@@ -688,6 +690,44 @@ async def test_fetch_channel_context_skips_other_bots_when_allow_bots_none(adapt
 
 
 @pytest.mark.asyncio
+async def test_fetch_channel_context_marks_only_meaningful_time_gaps(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    adapter.config.extra["history_backfill_limit"] = 10
+    human = SimpleNamespace(id=56, display_name="Alice", name="Alice", bot=False)
+    base = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    channel = FakeHistoryChannel(
+        [
+            make_history_message(
+                author=human,
+                content="same active exchange",
+                msg_id=3,
+                created_at=base + timedelta(minutes=5),
+            ),
+            make_history_message(
+                author=human,
+                content="older context",
+                msg_id=2,
+                created_at=base - timedelta(hours=3),
+            ),
+        ],
+        channel_id=123,
+    )
+    trigger = make_message(channel=channel, content="trigger")
+    trigger.id = 4
+    trigger.created_at = base + timedelta(days=2, minutes=5)
+
+    result = await adapter._fetch_channel_context(channel, before=trigger)
+
+    assert result == (
+        "[Recent channel messages]\n"
+        "[Alice] older context\n"
+        "[Time gap: 3 hours]\n"
+        "[Alice] same active exchange\n"
+        "[Time gap before current message: 2 days]"
+    )
+
+
+@pytest.mark.asyncio
 async def test_fetch_channel_context_uses_cache_to_narrow_window(adapter, monkeypatch):
     """When _last_self_message_id is cached, the fetch passes after= to skip old messages."""
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
@@ -882,5 +922,3 @@ async def test_discord_dm_does_not_backfill(adapter, monkeypatch):
     if adapter.handle_message.await_args is not None:
         event = adapter.handle_message.await_args.args[0]
         assert event.channel_context is None
-
-

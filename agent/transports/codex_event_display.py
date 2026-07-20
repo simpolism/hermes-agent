@@ -10,10 +10,10 @@ commands or file edits ran in between.
 
 This module is the bridge. It consumes raw `note: dict` notifications from
 codex's JSON-RPC stream (delivered via `CodexAppServerSession`'s `on_event`
-hook) and translates them into the same `progress_callback(event_type,
-tool_name, preview, args)` shape the agent already uses for native tools.
-The gateway's existing tool-progress rendering, dedup, queue, and edit logic
-then work without changes.
+hook) and translates them into both Hermes callback layers: the lightweight
+`progress_callback(event_type, tool_name, preview, args)` feed and the
+identity-bearing start/complete lifecycle used by the TUI, API/SSE, durations,
+and inline edit diffs.
 
 Mapping (item type → display name):
 
@@ -90,6 +90,15 @@ _INTERNAL_MCP_SERVER = "hermes-tools"
 # informative enough to identify the call. The gateway's
 # tool_preview_length config will further trim if configured.
 _PREVIEW_MAX_LEN = 200
+
+
+def _safe_callback(callback: Optional[Callable[..., Any]], *args: Any, **kwargs: Any) -> None:
+    if callback is None:
+        return
+    try:
+        callback(*args, **kwargs)
+    except Exception:  # pragma: no cover - display path is best-effort
+        logger.debug("codex tool lifecycle callback failed", exc_info=True)
 
 
 def _truncate(s: str, max_len: int = _PREVIEW_MAX_LEN) -> str:
@@ -239,11 +248,50 @@ def _classify(item: dict) -> Optional[tuple[str, str, dict]]:
     return None
 
 
+def _completion_result(item: dict) -> str:
+    """Return a useful string result for Hermes lifecycle consumers."""
+    for key in ("aggregatedOutput", "output", "result", "error"):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if value is not None:
+            try:
+                return json.dumps(value, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                return str(value)
+    try:
+        return json.dumps(item, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(item)
+
+
+def _completion_metadata(item: dict) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    duration_ms = item.get("durationMs")
+    if isinstance(duration_ms, (int, float)):
+        metadata["duration"] = max(0.0, float(duration_ms) / 1000.0)
+
+    status = str(item.get("status") or "").lower()
+    exit_code = item.get("exitCode")
+    metadata["is_error"] = bool(
+        status in {"failed", "error", "cancelled", "canceled"}
+        or (isinstance(exit_code, int) and exit_code != 0)
+        or item.get("error")
+        or item.get("success") is False
+    )
+    return metadata
+
+
 def make_progress_bridge(
     get_progress_callback: Callable[[], Optional[Callable[..., Any]]],
+    get_start_callback: Optional[
+        Callable[[], Optional[Callable[..., Any]]]
+    ] = None,
+    get_complete_callback: Optional[
+        Callable[[], Optional[Callable[..., Any]]]
+    ] = None,
 ) -> Callable[[dict], None]:
-    """Build an `on_event(note: dict)` adapter that translates codex
-    notifications into Hermes' progress_callback shape.
+    """Build an adapter from Codex notifications to Hermes tool callbacks.
 
     Args:
         get_progress_callback: a zero-arg callable returning the agent's
@@ -256,6 +304,10 @@ def make_progress_bridge(
             and the user would see nothing past the first turn.
 
             Typical call site: `make_progress_bridge(lambda: self.tool_progress_callback)`.
+
+        get_start_callback/get_complete_callback: optional late-bound getters
+            for Hermes' identity-bearing tool lifecycle. Codex item IDs are
+            used as correlation IDs.
 
     Returns:
         A callable suitable for passing as `on_event` to
@@ -272,9 +324,6 @@ def make_progress_bridge(
             # tool_progress_callback is per-turn state; capturing it once
             # would route every codex turn's tool events into the first
             # turn's queue.
-            progress_callback = get_progress_callback()
-            if progress_callback is None:
-                return
             method = note.get("method", "")
             if method not in _RENDER_METHODS:
                 return
@@ -286,11 +335,43 @@ def make_progress_bridge(
             if classified is None:
                 return
             display_name, preview, args = classified
+            item_id = str(item.get("id") or "")
             event_type = (
                 "tool.started" if method == "item/started"
                 else "tool.completed"
             )
-            progress_callback(event_type, display_name, preview, args)
+            progress_callback = get_progress_callback()
+            if progress_callback is not None:
+                if method == "item/completed":
+                    _safe_callback(
+                        progress_callback,
+                        event_type,
+                        display_name,
+                        preview,
+                        args,
+                        **_completion_metadata(item),
+                    )
+                else:
+                    _safe_callback(
+                        progress_callback, event_type, display_name, preview, args
+                    )
+
+            # Rich consumers (Ink TUI, API/SSE, inline diffs) need a stable
+            # identity-bearing lifecycle in addition to the lightweight
+            # progress feed. Codex item IDs provide exact correlation even
+            # when multiple calls of the same tool overlap.
+            if method == "item/started" and item_id and get_start_callback:
+                start_callback = get_start_callback()
+                _safe_callback(start_callback, item_id, display_name, args)
+            elif method == "item/completed" and item_id and get_complete_callback:
+                complete_callback = get_complete_callback()
+                _safe_callback(
+                    complete_callback,
+                    item_id,
+                    display_name,
+                    args,
+                    _completion_result(item),
+                )
         except Exception:  # pragma: no cover - display path is best-effort
             logger.debug(
                 "codex tool-progress bridge failed", exc_info=True

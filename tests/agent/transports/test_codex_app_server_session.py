@@ -159,6 +159,65 @@ class TestLifecycle:
         s.close()
         assert client._closed is True
 
+    def test_resumes_persisted_thread_instead_of_starting_new(self):
+        client = FakeClient()
+        ready = []
+
+        def handler(method, params):
+            if method == "thread/resume":
+                return {"thread": {"id": params["threadId"]}}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client._request_handler = handler
+        s = make_session(
+            client,
+            resume_thread_id="thread-existing",
+            on_thread_ready=ready.append,
+        )
+        assert s.ensure_started() == "thread-existing"
+        assert ("thread/resume", {"threadId": "thread-existing", "cwd": "/tmp"}) in client.requests
+        assert not any(method == "thread/start" for method, _ in client.requests)
+        assert ready == ["thread-existing"]
+
+    def test_missing_persisted_thread_falls_back_and_replaces_identity(self):
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        client = FakeClient()
+        ready = []
+
+        def handler(method, params):
+            if method == "thread/resume":
+                raise CodexAppServerError(code=-32602, message="rollout not found")
+            if method == "thread/start":
+                return {"thread": {"id": "thread-replacement"}}
+            raise AssertionError(f"unexpected method: {method}")
+
+        client._request_handler = handler
+        s = make_session(
+            client,
+            resume_thread_id="thread-stale",
+            on_thread_ready=ready.append,
+        )
+        assert s.ensure_started() == "thread-replacement"
+        assert [method for method, _ in client.requests] == [
+            "thread/resume", "thread/start"
+        ]
+        assert ready == ["thread-replacement"]
+
+    def test_malformed_resume_response_falls_back_to_start(self):
+        client = FakeClient()
+
+        def handler(method, params):
+            if method == "thread/resume":
+                return {"thread": {}}
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fresh"}}
+            return {}
+
+        client._request_handler = handler
+        s = make_session(client, resume_thread_id="thread-malformed")
+        assert s.ensure_started() == "thread-fresh"
+
 
 # ---- turn loop ----
 
@@ -185,6 +244,56 @@ class TestRunTurn:
                    for m in r.projected_messages)
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
+
+    @pytest.mark.parametrize(
+        "rich_input,expected",
+        [
+            (
+                [
+                    {"type": "text", "text": "compare these"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/a.png", "detail": "high"},
+                    },
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                ],
+                [
+                    {"type": "text", "text": "compare these"},
+                    {"type": "image", "url": "https://example.com/a.png", "detail": "high"},
+                    {"type": "image", "url": "data:image/png;base64,AAAA"},
+                ],
+            ),
+            (
+                [
+                    {"type": "input_text", "text": "inspect this"},
+                    {"type": "localImage", "path": "/tmp/example.png"},
+                ],
+                [
+                    {"type": "text", "text": "inspect this"},
+                    {"type": "localImage", "path": "/tmp/example.png"},
+                ],
+            ),
+        ],
+    )
+    def test_rich_input_uses_native_codex_items(self, rich_input, expected):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        r = s.run_turn(rich_input, turn_timeout=2.0)
+        assert r.error is None
+        _, params = next(call for call in client.requests if call[0] == "turn/start")
+        assert params["input"] == expected
+
+    def test_invalid_rich_input_returns_clear_error_without_rpc(self):
+        client = FakeClient()
+        s = make_session(client)
+        r = s.run_turn([{"type": "audio", "url": "x"}], turn_timeout=2.0)
+        assert r.error is not None
+        assert "Unsupported Codex app-server input item type" in r.error
+        assert not any(method == "turn/start" for method, _ in client.requests)
 
     def test_tool_iteration_counter_ticks(self):
         client = FakeClient()

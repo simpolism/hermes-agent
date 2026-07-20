@@ -85,6 +85,20 @@ def _clean_discord_id(entry: str) -> str:
     return entry.strip()
 
 
+def _format_history_time_gap(seconds: float) -> Optional[str]:
+    """Format only conversationally meaningful Discord history gaps."""
+    if seconds < 30 * 60:
+        return None
+    minutes = int(seconds // 60)
+    if minutes < 120:
+        return f"{minutes} minutes"
+    hours = int(seconds // 3600)
+    if hours < 48:
+        return f"{hours} hours"
+    days = int(seconds // 86400)
+    return f"{days} days"
+
+
 def check_discord_requirements() -> bool:
     """Check if Discord dependencies are available.
 
@@ -3679,7 +3693,7 @@ class DiscordAdapter(BasePlatformAdapter):
             pass  # Malformed cache entry — fall back to cold-start scan
 
         try:
-            collected = []
+            collected: list[tuple[Any, str]] = []
             # IMPORTANT: pass oldest_first=False explicitly.  discord.py 2.x
             # silently flips the default to True when `after=` is supplied,
             # which would select the *earliest* N messages after our last
@@ -3718,14 +3732,43 @@ class DiscordAdapter(BasePlatformAdapter):
                 name = msg.author.display_name
                 if getattr(msg.author, "bot", False):
                     name = f"{name} [bot]"
-                collected.append(f"[{name}] {content}")
+                collected.append(
+                    (getattr(msg, "created_at", None), f"[{name}] {content}")
+                )
 
             if not collected:
                 return ""
 
             # channel.history returns newest-first (oldest_first=False); reverse for chronological order
             collected.reverse()
-            return "[Recent channel messages]\n" + "\n".join(collected)
+            lines: list[str] = []
+            previous_timestamp = None
+            for timestamp, rendered in collected:
+                if previous_timestamp is not None and timestamp is not None:
+                    try:
+                        gap = _format_history_time_gap(
+                            (timestamp - previous_timestamp).total_seconds()
+                        )
+                    except (AttributeError, TypeError):
+                        gap = None
+                    if gap:
+                        lines.append(f"[Time gap: {gap}]")
+                lines.append(rendered)
+                if timestamp is not None:
+                    previous_timestamp = timestamp
+
+            trigger_timestamp = getattr(before, "created_at", None)
+            if previous_timestamp is not None and trigger_timestamp is not None:
+                try:
+                    gap = _format_history_time_gap(
+                        (trigger_timestamp - previous_timestamp).total_seconds()
+                    )
+                except (AttributeError, TypeError):
+                    gap = None
+                if gap:
+                    lines.append(f"[Time gap before current message: {gap}]")
+
+            return "[Recent channel messages]\n" + "\n".join(lines)
 
         except discord.Forbidden:
             logger.debug("[%s] Missing permissions to fetch channel history", self.name)

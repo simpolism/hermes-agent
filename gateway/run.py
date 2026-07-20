@@ -15485,17 +15485,30 @@ class GatewayRunner:
                 _native_imgs = self._consume_pending_native_image_paths(session_key)
                 if _native_imgs:
                     try:
-                        from agent.image_routing import build_native_content_parts
-                        _parts, _skipped = build_native_content_parts(
-                            message,
-                            _native_imgs,
-                        )
+                        if getattr(agent, "api_mode", "") == "codex_app_server":
+                            from agent.image_routing import build_codex_app_server_content_parts
+                            _parts, _skipped = build_codex_app_server_content_parts(
+                                message,
+                                _native_imgs,
+                            )
+                            _has_native_image = any(
+                                p.get("type") == "localImage" for p in _parts
+                            )
+                        else:
+                            from agent.image_routing import build_native_content_parts
+                            _parts, _skipped = build_native_content_parts(
+                                message,
+                                _native_imgs,
+                            )
+                            _has_native_image = any(
+                                p.get("type") == "image_url" for p in _parts
+                            )
                         if _skipped:
                             logger.warning(
                                 "Native image attachment: skipped %d unreadable path(s): %s",
                                 len(_skipped), _skipped,
                             )
-                        if any(p.get("type") == "image_url" for p in _parts):
+                        if _has_native_image:
                             _run_message: Any = _parts
                         else:
                             # All images failed to read — fall back to plain text.

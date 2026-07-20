@@ -85,6 +85,37 @@ class TestSessionLifecycle:
         session = db.get_session("s1")
         assert session["system_prompt"] == "You are a helpful assistant."
 
+    def test_session_model_config_value_merge_preserves_existing_config(self, db):
+        db.create_session(
+            session_id="s1",
+            source="discord",
+            model_config={"max_iterations": 90},
+        )
+        assert db.update_session_model_config_value(
+            "s1", "codex_app_server_thread_id", "thread-123"
+        ) is True
+        assert db.get_session_model_config("s1") == {
+            "max_iterations": 90,
+            "codex_app_server_thread_id": "thread-123",
+        }
+
+    def test_session_model_config_value_update_replaces_stale_thread(self, db):
+        db.create_session(
+            session_id="s1",
+            source="discord",
+            model_config={"codex_app_server_thread_id": "thread-stale"},
+        )
+        db.update_session_model_config_value(
+            "s1", "codex_app_server_thread_id", "thread-fresh"
+        )
+        assert (
+            db.get_session_model_config("s1")["codex_app_server_thread_id"]
+            == "thread-fresh"
+        )
+
+    def test_session_model_config_update_unknown_session_is_false(self, db):
+        assert db.update_session_model_config_value("missing", "key", "value") is False
+
     def test_update_token_counts(self, db):
         db.create_session(session_id="s1", source="cli")
         db.update_token_counts("s1", input_tokens=200, output_tokens=100)
@@ -2942,4 +2973,3 @@ class TestFTS5ToolCallMigration:
             assert version == 11
         finally:
             session_db.close()
-

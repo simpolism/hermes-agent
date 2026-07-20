@@ -130,6 +130,128 @@ class TestRunConversationCodexPath:
         )
         assert user_count == 1, f"user message appeared {user_count}× in {result['messages']}"
 
+    def test_projected_history_does_not_trigger_hermes_preflight_compression(
+        self, fake_session
+    ):
+        """Codex owns and compacts its native thread; Hermes history is audit-only."""
+        agent = _make_codex_agent()
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 100
+        agent.context_compressor.threshold_tokens = 85
+        oversized_history = [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": "x" * 10_000,
+            }
+            for i in range(40)
+        ]
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_spawn_background_review", return_value=None),
+        ):
+            result = agent.run_conversation(
+                "current turn", conversation_history=oversized_history
+            )
+
+        mock_compress.assert_not_called()
+        assert result["final_response"] == "echo: current turn"
+
+    def test_rich_user_message_reaches_codex_session_unchanged(self, monkeypatch):
+        captured = {}
+
+        def fake_run_turn(self, user_input, **kwargs):
+            captured["user_input"] = user_input
+            return TurnResult(
+                final_text="seen",
+                projected_messages=[{"role": "assistant", "content": "seen"}],
+                turn_id="t-rich",
+                thread_id="th-rich",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "th-rich"
+        )
+        rich_input = [
+            {"type": "text", "text": "what is this?"},
+            {"type": "localImage", "path": "/tmp/example.png"},
+        ]
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation(rich_input)
+
+        assert result["final_response"] == "seen"
+        assert captured["user_input"] == rich_input
+        assert result["messages"][0]["content"] == rich_input
+
+    def test_native_thread_identity_survives_agent_reconstruction(
+        self, monkeypatch, tmp_path
+    ):
+        from hermes_state import SessionDB
+
+        constructor_kwargs = []
+
+        def fake_init(self, **kwargs):
+            constructor_kwargs.append(kwargs)
+            if kwargs.get("on_thread_ready"):
+                kwargs["on_thread_ready"](
+                    kwargs.get("resume_thread_id") or "native-thread-1"
+                )
+
+        def fake_run_turn(self, user_input, **kwargs):
+            thread_id = constructor_kwargs[-1].get("resume_thread_id") or "native-thread-1"
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+                turn_id="turn-1",
+                thread_id=thread_id,
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            def make_agent():
+                return run_agent.AIAgent(
+                    api_key="stub",
+                    base_url="https://stub.invalid",
+                    provider="openai",
+                    api_mode="codex_app_server",
+                    quiet_mode=True,
+                    skip_context_files=True,
+                    skip_memory=True,
+                    session_id="hermes-session-1",
+                    session_db=db,
+                )
+
+            first = make_agent()
+            first.run_conversation("first")
+            assert db.get_session_model_config("hermes-session-1")[
+                "codex_app_server_thread_id"
+            ] == "native-thread-1"
+
+            second = make_agent()
+            second.run_conversation("after restart")
+            assert constructor_kwargs[-1]["resume_thread_id"] == "native-thread-1"
+        finally:
+            db.close()
+
+    def test_session_reset_retires_cached_native_codex_thread(self):
+        agent = _make_codex_agent()
+
+        class CachedSession:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        cached = CachedSession()
+        agent._codex_session = cached
+        agent.reset_session_state()
+        assert cached.closed is True
+        assert agent._codex_session is None
+
     def test_background_review_NOT_invoked_below_threshold(self, fake_session):
         """A single turn shouldn't trigger background review — counters
         haven't reached the nudge interval (default 10)."""
@@ -275,6 +397,12 @@ class TestRunConversationCodexPath:
 
         agent = _make_codex_agent()
         agent.tool_progress_callback = progress_cb
+        lifecycle_calls = []
+        agent.tool_start_callback = (
+            lambda tool_id, name, args: lifecycle_calls.append(
+                ("start", tool_id, name, args)
+            )
+        )
 
         with patch.object(agent, "_spawn_background_review", return_value=None):
             agent.run_conversation("write something")
@@ -304,6 +432,14 @@ class TestRunConversationCodexPath:
         assert event_type == "tool.started"
         assert tool_name == "exec_command"
         assert "echo hello" in preview
+        assert lifecycle_calls == [
+            (
+                "start",
+                "x",
+                "exec_command",
+                {"command": "echo hello", "cwd": "/tmp"},
+            )
+        ]
 
     def test_on_event_late_binds_per_turn_progress_callback(self, monkeypatch):
         """The CodexAppServerSession is cached across turns but the

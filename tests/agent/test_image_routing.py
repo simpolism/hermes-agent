@@ -11,6 +11,7 @@ import pytest
 from agent.image_routing import (
     _coerce_mode,
     _explicit_aux_vision_override,
+    build_codex_app_server_content_parts,
     build_native_content_parts,
     decide_image_input_mode,
 )
@@ -244,6 +245,42 @@ class TestBuildNativeContentParts:
         assert url.startswith("data:image/png;base64,"), (
             f"Expected MIME sniffing to detect PNG bytes regardless of .webp suffix, got: {url[:60]}"
         )
+
+
+class TestBuildCodexAppServerContentParts:
+    def test_uses_local_images_without_reading_or_encoding(self, tmp_path: Path):
+        first = tmp_path / "first.png"
+        second = tmp_path / "second.jpg"
+        first.write_bytes(_png_bytes())
+        second.write_bytes(b"not-important")
+
+        with patch("pathlib.Path.read_bytes") as read_bytes:
+            parts, skipped = build_codex_app_server_content_parts(
+                "compare these", [str(first), str(second)]
+            )
+
+        assert skipped == []
+        read_bytes.assert_not_called()
+        assert parts[0]["type"] == "text"
+        assert str(first) in parts[0]["text"]
+        assert str(second) in parts[0]["text"]
+        assert parts[1:] == [
+            {"type": "localImage", "path": str(first)},
+            {"type": "localImage", "path": str(second)},
+        ]
+
+    def test_skips_missing_paths_and_does_not_advertise_them(self, tmp_path: Path):
+        good = tmp_path / "good.png"
+        missing = tmp_path / "missing.png"
+        good.write_bytes(_png_bytes())
+
+        parts, skipped = build_codex_app_server_content_parts(
+            "inspect", [str(good), str(missing)]
+        )
+
+        assert skipped == [str(missing)]
+        assert parts[-1] == {"type": "localImage", "path": str(good)}
+        assert str(missing) not in parts[0]["text"]
 
 
 # ─── Oversize handling ───────────────────────────────────────────────────────

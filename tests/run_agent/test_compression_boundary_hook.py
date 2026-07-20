@@ -86,6 +86,43 @@ class TestCompressionBoundaryHook:
             assert call.kwargs.get("old_session_id") == original_sid, \
                 f"Expected old_session_id={original_sid!r}, got {call.kwargs!r}"
 
+    def test_compression_child_inherits_native_codex_thread_id(self):
+        """An explicit compression split must not orphan app-server identity."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            original_sid = agent.session_id
+            agent._ensure_db_session()
+            db.update_session_model_config_value(
+                original_sid,
+                "codex_app_server_thread_id",
+                "native-thread-123",
+            )
+
+            compressor = MagicMock()
+            compressor.compress.return_value = [
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                {"role": "user", "content": "tail question"},
+            ]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            agent.context_compressor = compressor
+
+            agent._compress_context(
+                [{"role": "user", "content": f"m{i}"} for i in range(10)],
+                "sys",
+                approx_tokens=10_000,
+            )
+
+            assert agent.session_id != original_sid
+            assert db.get_session_model_config(agent.session_id)[
+                "codex_app_server_thread_id"
+            ] == "native-thread-123"
+
     def test_no_hook_when_no_session_db(self):
         """Without session_db, session_id does not rotate and the hook is not fired."""
         from run_agent import AIAgent
