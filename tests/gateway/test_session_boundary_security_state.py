@@ -220,6 +220,30 @@ async def test_branch_preserves_persisted_assistant_metadata():
     assert assistant_kwargs["codex_message_items"] == [{"id": "m1", "type": "message"}]
 
 
+@pytest.mark.asyncio
+async def test_branch_warns_when_native_codex_context_starts_fresh():
+    runner, _session_key = _make_branch_runner()
+    runner._session_db.get_session.return_value = {
+        "model_config": '{"codex_app_server_thread_id":"thread-original"}'
+    }
+
+    result = await runner._handle_branch_command(_make_event("/branch"))
+
+    assert "Branched to" in result
+    assert "starts a fresh native Codex thread" in result
+
+
+@pytest.mark.asyncio
+async def test_standard_branch_does_not_show_codex_continuity_warning():
+    runner, _session_key = _make_branch_runner()
+    runner._session_db.get_session.return_value = {"model_config": "{}"}
+
+    result = await runner._handle_branch_command(_make_event("/branch"))
+
+    assert "Branched to" in result
+    assert "fresh native Codex thread" not in result
+
+
 def test_clear_session_boundary_security_state_is_scoped():
     """The helper must wipe only the target session's approval/yolo state.
 

@@ -64,10 +64,14 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _MEDIA_TAG_RE = re.compile(r"MEDIA:(\S+)")
+_TRUSTED_TTS_PRODUCERS = {
+    "text_to_speech",
+    "mcp.hermes-tools.text_to_speech",
+}
 
 
 def _collect_current_turn_media_tags(
-    messages: list[dict], history_len: int
+    messages: list[dict], history_messages: list[dict]
 ) -> tuple[list[str], bool]:
     """Collect safe, tool-produced media from only the current turn.
 
@@ -78,15 +82,29 @@ def _collect_current_turn_media_tags(
     to Hermes' own image cache.  Explicit tags in the assistant's final reply
     continue to be handled by the platform adapter.
     """
-    current = messages[history_len:] if len(messages) > history_len else []
+    # Correlate by tool-call identity instead of list position. Mid-turn
+    # compression can replace the message prefix and make ``history_len``
+    # larger than the returned list; stable call IDs still distinguish old
+    # tool pairs from calls made during this turn.
+    historical_call_ids = {
+        str(call.get("id"))
+        for message in history_messages
+        if message.get("role") == "assistant"
+        for call in (message.get("tool_calls") or [])
+        if call.get("id")
+    }
     producers: dict[str, str] = {}
-    for message in current:
+    for message in messages:
         if message.get("role") != "assistant":
             continue
         for call in message.get("tool_calls") or []:
             call_id = call.get("id")
             function = call.get("function") or {}
-            if call_id and function.get("name"):
+            if (
+                call_id
+                and str(call_id) not in historical_call_ids
+                and function.get("name")
+            ):
                 producers[str(call_id)] = str(function["name"])
 
     try:
@@ -99,12 +117,12 @@ def _collect_current_turn_media_tags(
     tags: list[str] = []
     seen: set[str] = set()
     has_voice_directive = False
-    for message in current:
+    for message in messages:
         if message.get("role") not in {"tool", "function"}:
             continue
         producer = producers.get(str(message.get("tool_call_id") or ""), "")
-        producer_leaf = producer.rsplit(".", 1)[-1]
-        if producer_leaf != "text_to_speech" and not producer.startswith("mcp."):
+        trusted_tts = producer in _TRUSTED_TTS_PRODUCERS
+        if not trusted_tts and not producer.startswith("mcp."):
             continue
         content = message.get("content") or ""
         for match in _MEDIA_TAG_RE.finditer(str(content)):
@@ -116,14 +134,14 @@ def _collect_current_turn_media_tags(
                 continue
             if not resolved.is_file():
                 continue
-            if producer.startswith("mcp.") and producer_leaf != "text_to_speech":
+            if producer.startswith("mcp.") and not trusted_tts:
                 if image_cache is None or not resolved.is_relative_to(image_cache):
                     continue
             tag = f"MEDIA:{resolved}"
             if tag not in seen:
                 seen.add(tag)
                 tags.append(tag)
-        if producer_leaf == "text_to_speech" and "[[audio_as_voice]]" in str(content):
+        if trusted_tts and "[[audio_as_voice]]" in str(content):
             has_voice_directive = True
 
     return tags, has_voice_directive
@@ -137,6 +155,22 @@ def _gateway_hygiene_enabled(compression_enabled: bool, api_mode: Optional[str])
     second compression boundary immediately before ``thread/resume``.
     """
     return compression_enabled and api_mode != "codex_app_server"
+
+
+def _session_has_native_codex_thread(session: Any) -> bool:
+    """Return whether persisted session metadata owns a native Codex thread."""
+    if not isinstance(session, dict):
+        return False
+    config = session.get("model_config")
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except (TypeError, ValueError):
+            return False
+    return bool(
+        isinstance(config, dict)
+        and str(config.get("codex_app_server_thread_id") or "").strip()
+    )
 
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
@@ -11738,6 +11772,16 @@ class GatewayRunner:
             branch_title = self._session_db.get_next_title_in_lineage(base)
 
         parent_session_id = current_entry.session_id
+        parent_has_native_codex_thread = False
+        try:
+            parent_has_native_codex_thread = _session_has_native_codex_thread(
+                self._session_db.get_session(parent_session_id)
+            )
+        except Exception:
+            logger.debug(
+                "Could not inspect native Codex metadata before branch",
+                exc_info=True,
+            )
 
         # Create the new session with parent link
         try:
@@ -11788,7 +11832,20 @@ class GatewayRunner:
 
         msg_count = len([m for m in history if m.get("role") == "user"])
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
-        return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
+        response = t(
+            key,
+            title=branch_title,
+            count=msg_count,
+            parent=parent_session_id,
+            new=new_session_id,
+        )
+        if parent_has_native_codex_thread:
+            response += (
+                "\n\n⚠️ This branch copied the Hermes transcript but starts a fresh "
+                "native Codex thread, so private reasoning and tool state from the "
+                "original thread are not shared."
+            )
+        return response
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
@@ -15650,7 +15707,7 @@ class GatewayRunner:
             #
             if "MEDIA:" not in final_response:
                 media_tags, has_voice_directive = _collect_current_turn_media_tags(
-                    result.get("messages", []), len(agent_history)
+                    result.get("messages", []), agent_history
                 )
                 if media_tags:
                     if has_voice_directive:

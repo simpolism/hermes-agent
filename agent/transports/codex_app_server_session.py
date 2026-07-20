@@ -189,6 +189,17 @@ def _normalize_turn_input(user_input: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def _extract_thread_id(result: dict[str, Any]) -> Optional[str]:
+    """Read a thread identity across supported Codex protocol versions."""
+    thread = result.get("thread") or {}
+    return (
+        thread.get("id")
+        or thread.get("sessionId")
+        or result.get("sessionId")
+        or result.get("threadId")
+    )
+
+
 @dataclass
 class _ServerRequestRouting:
     """Default policies for codex-side approval requests when no interactive
@@ -320,13 +331,7 @@ class CodexAppServerSession:
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
         # at handshake time.
-        thread_obj = result.get("thread") or {}
-        thread_id = (
-            thread_obj.get("id")
-            or thread_obj.get("sessionId")
-            or result.get("sessionId")
-            or result.get("threadId")
-        )
+        thread_id = _extract_thread_id(result)
         if not thread_id and resumed:
             logger.warning(
                 "codex app-server thread/resume returned no thread id for %s; "
@@ -340,13 +345,7 @@ class CodexAppServerSession:
             if self._model:
                 start_params["model"] = self._model
             result = self._client.request("thread/start", start_params, timeout=15)
-            thread_obj = result.get("thread") or {}
-            thread_id = (
-                thread_obj.get("id")
-                or thread_obj.get("sessionId")
-                or result.get("sessionId")
-                or result.get("threadId")
-            )
+            thread_id = _extract_thread_id(result)
         if not thread_id:
             raise CodexAppServerError(
                 code=-32603,

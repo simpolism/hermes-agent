@@ -205,7 +205,7 @@ class TestSecureCurrentTurnMediaExtraction:
             },
         ]
 
-        assert _collect_current_turn_media_tags(messages, 0) == ([], False)
+        assert _collect_current_turn_media_tags(messages, []) == ([], False)
 
     def test_tts_file_is_forwarded_and_deduplicated(self, tmp_path):
         audio = tmp_path / "speech.ogg"
@@ -226,7 +226,7 @@ class TestSecureCurrentTurnMediaExtraction:
             },
         ]
 
-        assert _collect_current_turn_media_tags(messages, 0) == (
+        assert _collect_current_turn_media_tags(messages, []) == (
             [f"MEDIA:{audio.resolve()}"],
             True,
         )
@@ -252,7 +252,7 @@ class TestSecureCurrentTurnMediaExtraction:
             },
         ]
 
-        assert _collect_current_turn_media_tags(messages, 0) == (
+        assert _collect_current_turn_media_tags(messages, []) == (
             [f"MEDIA:{audio.resolve()}"],
             True,
         )
@@ -266,7 +266,7 @@ class TestSecureCurrentTurnMediaExtraction:
             "content": f"MEDIA:{media}",
         }]
 
-        assert _collect_current_turn_media_tags(messages, 0) == ([], False)
+        assert _collect_current_turn_media_tags(messages, []) == ([], False)
 
     def test_remote_mcp_cannot_forward_arbitrary_local_file(self, tmp_path):
         secret = tmp_path / "secret.txt"
@@ -276,7 +276,7 @@ class TestSecureCurrentTurnMediaExtraction:
                 "role": "assistant",
                 "tool_calls": [{
                     "id": "remote-1",
-                    "function": {"name": "mcp.remote.untrusted", "arguments": "{}"},
+                    "function": {"name": "mcp.remote.text_to_speech", "arguments": "{}"},
                 }],
             },
             {
@@ -286,7 +286,7 @@ class TestSecureCurrentTurnMediaExtraction:
             },
         ]
 
-        assert _collect_current_turn_media_tags(messages, 0) == ([], False)
+        assert _collect_current_turn_media_tags(messages, []) == ([], False)
 
     def test_history_is_not_rescanned(self, tmp_path):
         audio = tmp_path / "old.ogg"
@@ -307,7 +307,50 @@ class TestSecureCurrentTurnMediaExtraction:
         ]
         messages = history + [{"role": "assistant", "content": "new reply"}]
 
-        assert _collect_current_turn_media_tags(messages, len(history)) == ([], False)
+        assert _collect_current_turn_media_tags(messages, history) == ([], False)
+
+    def test_compressed_result_uses_call_identity_not_history_length(self, tmp_path):
+        old_audio = tmp_path / "old.ogg"
+        new_audio = tmp_path / "new.ogg"
+        old_audio.write_bytes(b"old")
+        new_audio.write_bytes(b"new")
+        history = [
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "old-tts",
+                    "function": {"name": "text_to_speech", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "old-tts",
+                "content": f"MEDIA:{old_audio}",
+            },
+            {"role": "assistant", "content": "old response"},
+        ]
+        # Simulate a compressor replacing the long history with a summary and
+        # retaining the current turn's complete tool pair.
+        compressed_result = [
+            {"role": "assistant", "content": "summary"},
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "new-tts",
+                    "function": {"name": "text_to_speech", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "new-tts",
+                "content": f"MEDIA:{new_audio}",
+            },
+        ]
+
+        assert _collect_current_turn_media_tags(compressed_result, history) == (
+            [f"MEDIA:{new_audio.resolve()}"],
+            False,
+        )
 
 
 if __name__ == "__main__":
